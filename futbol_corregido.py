@@ -10,8 +10,6 @@ import math
 import pickle
 from pathlib import Path
 from collections import Counter, defaultdict, deque
-from auto_calibrador import AutoCalibrador  # <-- AGREGAR
-
 from view_transformer_tramos import InterpolatedViewTransformer
 from auto_calibrador import AutoCalibrador
 
@@ -1690,13 +1688,15 @@ def nearest_rival_pairs(field_players, max_draw_distance):
         if not rivals:
             continue
 
-        rival = min(
-            rivals,
-            key=lambda other: math.hypot(
-                player["x"] - other["x"],
-                player["y"] - other["y"],
-            ),
-        )
+        def _pair_distance(other):
+            if player.get("world") is not None and other.get("world") is not None:
+                return float(np.linalg.norm(
+                    np.asarray(player["world"], dtype=float) -
+                    np.asarray(other["world"], dtype=float)
+                ))
+            return math.hypot(player["x"] - other["x"], player["y"] - other["y"])
+
+        rival = min(rivals, key=_pair_distance)
 
         pair_key = tuple(sorted((
             (player["team"], player["id"]),
@@ -1727,7 +1727,8 @@ def nearest_rival_pairs(field_players, max_draw_distance):
 
         pairs.append((dpx, distance, unit, player, rival))
 
-    pairs.sort(key=lambda row: row[0])
+    # Ordenar por distancia real cuando ambos jugadores tienen coordenadas métricas.
+    pairs.sort(key=lambda row: row[1])
 
     return pairs[:5]
 
@@ -1935,7 +1936,7 @@ def create_tactical_video(
 
                     if ball_world is not None and player["world"] is not None:
                         distance_m = float(np.linalg.norm(
-                            np.asarray(player["world"]) - ball_world
+                            np.asarray(player["world"], dtype=float) - ball_world
                         ))
                         label = (
                             f"E{player['team']}-J{player['id']} balón: "
@@ -2053,24 +2054,27 @@ def create_tactical_video(
                     except (TypeError, ValueError):
                         return None
 
+                dist_pase_m = _fmt(active_event.get("distancia_pase_m"), "m")
                 dist_pase_px = _fmt(active_event.get("distancia_pase_px"), "px")
-                dist_def_px = _fmt(
-                    active_event.get("distancia_defensor_receptor_px"), "px"
-                )
+                dist_def_m = _fmt(active_event.get("distancia_defensor_receptor_m"), "m")
+                dist_def_px = _fmt(active_event.get("distancia_defensor_receptor_px"), "px")
                 vel_px = _fmt(active_event.get("velocidad_pase_px_s"), "px/s")
                 vel_m = _fmt(active_event.get("velocidad_pase_m_s"), "m/s")
+                vel_kmh = _fmt(active_event.get("velocidad_pase_km_h"), "km/h")
 
                 lineas = []
-                if dist_pase_px:
-                    lineas.append(f"Distancia del pase: {dist_pase_px}")
-                if dist_def_px:
-                    lineas.append(
-                        f"Defensor mas cercano al receptor: {dist_def_px}"
-                    )
+                if dist_pase_m:
+                    lineas.append(f"Distancia del pase: {dist_pase_m}")
+                elif dist_pase_px:
+                    lineas.append(f"Distancia del pase: {dist_pase_px} (sin calibrar)")
+                if dist_def_m:
+                    lineas.append(f"Defensor-receptor: {dist_def_m}")
+                elif dist_def_px:
+                    lineas.append(f"Defensor-receptor: {dist_def_px} (sin calibrar)")
                 if vel_m:
-                    lineas.append(f"Velocidad del pase: {vel_m}")
+                    lineas.append(f"Velocidad del pase: {vel_m}" + (f" ({vel_kmh})" if vel_kmh else ""))
                 elif vel_px:
-                    lineas.append(f"Velocidad del pase: {vel_px}")
+                    lineas.append(f"Velocidad del pase: {vel_px} (sin calibrar)")
 
                 ey = min(max(200, height - 90), height - 70)
                 alto_caja = 30 + 22 * (1 + len(lineas))
