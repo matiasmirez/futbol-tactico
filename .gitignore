@@ -1,0 +1,21 @@
+# Entornos virtuales
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Modelos pesados
+modelos/
+models/
+
+# Videos y salidas
+output_videos/
+stubs/
+*.avi
+*.mp4
+
+# Diagnósticos
+debug_keypoints_frame.png
+*.png
+
+!tactical_map_*.png

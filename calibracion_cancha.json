@@ -1,0 +1,23 @@
+{
+  "instrucciones": "Configurá estos puntos antes de usar metros. pixel_vertices debe contener cuatro coordenadas [x,y] REALES de la cancha en el video. Orden sugerido: esquina superior-izquierda, superior-derecha, inferior-derecha, inferior-izquierda siguiendo el polígono visible. Deben corresponder exactamente en orden con field_vertices_m. Mientras pixel_vertices sea null, el programa seguirá mostrando px y no inventará metros.",
+  "pixel_vertices": null,
+  "field_vertices_m": [
+    [
+      0,
+      0
+    ],
+    [
+      105,
+      0
+    ],
+    [
+      105,
+      68
+    ],
+    [
+      0,
+      68
+    ]
+  ],
+  "nota": "No usar las esquinas del fotograma como sustituto de las esquinas de la cancha. Una homografía estática deja de ser válida cuando la cámara panea o hace zoom."
+}
