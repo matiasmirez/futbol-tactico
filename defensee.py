@@ -10,7 +10,7 @@ import csv
 import math
 from pathlib import Path
 from typing import Any, Iterable
-
+import numpy as np
 TEAM_IDS = (1, 2)
 REFEREE_ROLES = {"referee", "arbitro", "official"}
 GOALKEEPER_ROLES = {"goalkeeper", "goalie", "arquero"}
@@ -172,28 +172,63 @@ def _infer_possession(players, ball_pos, last_team, scale):
 
 # NUEVO: helper para calcular velocidad de pase en px/s y, si hay homografia,
 # en m/s. Devuelve (vel_px_s, vel_m_s_o_None).
-def _pass_speed(ball_start, ball_end, dt, view_transformer=None):
+
+def _pass_speed(
+    ball_start,
+    ball_end,
+    dt,
+    view_transformer=None,
+    start_frame=None,
+    end_frame=None,
+):
+    """Calcula velocidad en px/s y, si es posible, en m/s."""
     travel_px = _distance(ball_start, ball_end)
     vel_px_s = travel_px / dt if dt > 1e-9 else None
-
     vel_m_s = None
-    if view_transformer is not None and getattr(view_transformer, "enabled", False):
-        try:
+
+    if (
+        view_transformer is None
+        or not getattr(view_transformer, "enabled", False)
+        or dt <= 1e-9
+    ):
+        return vel_px_s, vel_m_s
+
+    try:
+        if start_frame is not None and end_frame is not None:
+            w_start = view_transformer.transform_point(
+                ball_start, frame_num=start_frame
+            )
+            w_end = view_transformer.transform_point(
+                ball_end, frame_num=end_frame
+            )
+        else:
             w_start = view_transformer.transform_point(ball_start)
             w_end = view_transformer.transform_point(ball_end)
-        except Exception:
-            w_start = w_end = None
 
-        if w_start is not None and w_end is not None:
-            dist_m = math.hypot(
-                float(w_end[0]) - float(w_start[0]),
-                float(w_end[1]) - float(w_start[1]),
-            )
-            if dt > 1e-9:
-                vel_m_s = dist_m / dt
+        if w_start is None or w_end is None:
+            return vel_px_s, None
+
+        w_start = np.asarray(w_start, dtype=float).reshape(-1)
+        w_end = np.asarray(w_end, dtype=float).reshape(-1)
+
+        if (
+            w_start.size < 2
+            or w_end.size < 2
+            or not np.isfinite(w_start[:2]).all()
+            or not np.isfinite(w_end[:2]).all()
+        ):
+            return vel_px_s, None
+
+        dist_m = float(np.linalg.norm(w_end[:2] - w_start[:2]))
+        vel_m_s = dist_m / dt
+
+        if not math.isfinite(vel_m_s):
+            vel_m_s = None
+
+    except (TypeError, ValueError, IndexError, AttributeError):
+        vel_m_s = None
 
     return vel_px_s, vel_m_s
-
 
 def detectar_alertas_defensivas(
     tracks: dict,
@@ -290,8 +325,14 @@ def detectar_alertas_defensivas(
 
         # NUEVO: velocidad del pase (px/s y, si hay homografia, m/s)
         dt_pass = max(1e-6, window / fps)
+
         vel_px_s, vel_m_s = _pass_speed(
-            ball_start, ball_end, dt_pass, view_transformer=view_transformer
+            ball_start,
+            ball_end,
+            dt_pass,
+            view_transformer=view_transformer,
+            start_frame=i - window,
+            end_frame=i,
         )
 
         if end_team != start_team:

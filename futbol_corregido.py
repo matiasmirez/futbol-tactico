@@ -1763,17 +1763,24 @@ def create_tactical_video(
         raise RuntimeError(f"No se pudo crear el video: {output_path}")
 
     # --- Helper interno: transformar punto soportando ambos transformers ---
-    def _transform(self, point, frame_num=0):
+
+    # --- Helper interno: transformar punto soportando ambos transformers ---
+    def _transform(point, frame_num=0):
         if view_transformer is None or not getattr(view_transformer, "enabled", False):
             return None
+
         if point is None:
             return None
-        try:
-            return view_transformer.transform_point(point, frame_num=frame_num)
-        except TypeError:
-            # ViewTransformer viejo: no acepta frame_num
-            return view_transformer.transform_point(point)
 
+        try:
+            return view_transformer.transform_point(
+                point,
+                frame_num=frame_num
+            )
+        except TypeError:
+            # Compatibilidad con ViewTransformer antiguo,
+            # cuyo método solo recibe el punto.
+            return view_transformer.transform_point(point)
     previous_positions = {}
     previous_ball_world = None
     previous_ball_frame = None
