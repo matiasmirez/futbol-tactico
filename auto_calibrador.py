@@ -366,53 +366,44 @@ class AutoCalibrador:
             self.pixel_vertices[mas_cercano],
         )
 
+
     def transform_point(self, point, frame_num=0):
-        # --- BLINDAJE: validar entrada ---
+        """Transforma un punto de imagen a metros usando la homografía."""
+
         if not self.enabled or point is None or not self.homografias:
             return None
 
         try:
-            arr = np.asarray(point, dtype=np.float32).reshape(-1)
-        except (ValueError, TypeError):
-            return None
+            p = np.asarray(point, dtype=np.float32).reshape(-1)
 
-        if arr.size < 2:
-            return None
+            if p.size < 2:
+                return None
 
-        p = arr[:2]
+            p = p[:2]
 
-        if not np.isfinite(p).all():
-            return None
+            if not np.isfinite(p).all():
+                return None
 
-        H, pixels = self._homografia_mas_cercana(frame_num)
-        if H is None:
-            return None
+            H, _ = self._homografia_mas_cercana(frame_num)
 
-        # Filtro suave: rechazar solo puntos MUY lejos del polígono
-        if pixels is not None and len(pixels) == 4:
-            try:
-                inside = cv2.pointPolygonTest(
-                    pixels, (float(p[0]), float(p[1])), True
-                )
-                # inside > 0: dentro
-                # inside < 0: fuera, en píxeles
-                # Aceptar puntos hasta 300 px fuera del polígono
-                if inside < -300.0:
-                    return None
-            except cv2.error:
-                pass
+            if H is None or not np.isfinite(H).all():
+                return None
 
-        try:
+            # No rechazar el balón por estar fuera del área penal.
+            # La homografía se puede extrapolar al resto de la cancha.
             transformed = cv2.perspectiveTransform(
-                p.reshape(1, 1, 2), H
+                p.reshape(1, 1, 2),
+                H
             ).reshape(2)
-        except cv2.error:
+
+            if not np.isfinite(transformed).all():
+                return None
+
+            return transformed.astype(float)
+
+        except (ValueError, TypeError, IndexError, cv2.error):
             return None
 
-        if not np.isfinite(transformed).all():
-            return None
-
-        return transformed.astype(float)
 
     def add_transformed_position_to_tracks(self, tracks):
         if not self.enabled or not self.homografias:
