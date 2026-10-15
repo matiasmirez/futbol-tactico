@@ -1,422 +1,359 @@
+"""Calibración métrica parcial para vídeo de fútbol.
+
+Usa los cuatro keypoints del área penal cuando son visibles y optical flow
+entre redetecciones. No inventa una escala si no hay homografía válida.
 """
-auto_calibrador.py
-
-Calibrador automático con Soccana_Keypoint + optical flow.
-
-Estrategia:
-  1. Recorre el video buscando el frame donde la visibilidad de los
-     4 puntos del área grande sea máxima Y formen un rectángulo coherente.
-  2. En ese frame calcula la homografía inicial.
-  3. Propaga los 4 puntos al resto del video con optical flow,
-     recalculando la homografía en cada frame.
-
-Interfaz compatible con el pipeline:
-  - enabled
-  - transform_point(point, frame_num=0)
-  - add_transformed_position_to_tracks(tracks)
-  - calibrar_frames(frames)
-"""
-
 from __future__ import annotations
 
+from pathlib import Path
 import cv2
 import numpy as np
-from pathlib import Path
 from ultralytics import YOLO
+from base_estadios import cargar_base_estadios, buscar_estadio
 
-
-# ============ CONFIGURACIÓN ============
-
-MODEL_PATH = (
-    Path(__file__).resolve().parent
-    / "modelos" / "Model" / "weights" / "best.pt"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_CANDIDATES = (
+    BASE_DIR / "modelos" / "Model" / "weights" / "best.pt",
+    BASE_DIR / "models" / "best.pt",
+    BASE_DIR / "model" / "best.pt",
 )
+MODEL_PATH = next((p for p in MODEL_CANDIDATES if p.exists()), MODEL_CANDIDATES[0])
+ESTADIO_PREDETERMINADO = "Estadio Jalisco"
 
-ANCHO_AREA_M = 40.32
-ALTO_AREA_M = 16.5
-
-FIELD_POINTS_M = np.array([
-    [0.0,           0.0],
-    [ANCHO_AREA_M,  0.0],
-    [ANCHO_AREA_M,  ALTO_AREA_M],
-    [0.0,           ALTO_AREA_M],
-], dtype=np.float32)
-
-# Índices de los 4 puntos del área grande
-KEYPOINTS_AREAS = [
-    [1, 2, 3, 4],       # área izquierda
-    [17, 18, 19, 20],   # área derecha
-]
-
-# Visibilidad mínima para aceptar un keypoint en la búsqueda del mejor frame
-VISIBILIDAD_MIN_BUSQUEDA = 0.15
-
-# Cada cuántos frames revisar durante la búsqueda del mejor frame
-PASO_BUSQUEDA = 3
-
-# Parámetros de optical flow
+# Las dimensiones reglamentarias del área penal se cargan desde estadios.json.
+# La dimensión total del estadio NO se usa como si fueran las esquinas del área.
+_BASE_ESTADIOS = cargar_base_estadios()
+_REGLAS = _BASE_ESTADIOS.get("reglas_ifab", {})
+ANCHO_AREA_M = float(_REGLAS.get("area_penal_ancho_m", 40.32))
+ALTO_AREA_M = float(_REGLAS.get("area_penal_profundidad_m", 16.5))
+FIELD_POINTS_M = np.array(
+    [[0.0, 0.0], [ANCHO_AREA_M, 0.0],
+     [ANCHO_AREA_M, ALTO_AREA_M], [0.0, ALTO_AREA_M]],
+    dtype=np.float32,
+)
+KEYPOINTS_AREAS = ((1, 2, 3, 4), (17, 18, 19, 20))
+VISIBILITY_MIN = 0.25
+REDETECT_EVERY = 12
+MIN_POLYGON_AREA_PX = 1500.0
+ASPECT_MIN = 1.15
+ASPECT_MAX = 9.0
+MAX_CORNER_STEP_PX = 180.0
 LK_PARAMS = dict(
-    winSize=(21, 21),
-    maxLevel=3,
+    winSize=(21, 21), maxLevel=3,
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
 )
 
-# --- Validación geométrica del área detectada ---
-# Relación de aspecto esperada del área (ancho / alto en píxeles).
-# Para una vista aérea perfecta sería ANCHO_AREA_M / ALTO_AREA_M = 2.44.
-# En una vista de cámara de fútbol real, suele estar entre 1.5 y 6.0.
-ASPECTO_MIN = 1.2
-ASPECTO_MAX = 8.0
-
-# Área mínima del polígono en píxeles (para descartar detecciones basura)
-AREA_MIN_PX = 5000.0
-
 
 class AutoCalibrador:
-    def __init__(self, model_path=MODEL_PATH):
+    """Transforma puntos de imagen a coordenadas métricas locales de cancha.
+
+    `transform_point(point, frame_num=...)` mantiene compatibilidad con el
+    pipeline existente. Si no existe homografía válida para ese frame devuelve
+    None, nunca convierte píxeles a metros mediante una escala arbitraria.
+    """
+    def __init__(self, model_path=MODEL_PATH, estadio=ESTADIO_PREDETERMINADO):
         self.enabled = False
         self.modelo = None
-        self.homografias = {}
-        self.pixel_vertices = {}
-        self.field_m = FIELD_POINTS_M
+        self.homografias: dict[int, np.ndarray] = {}
+        self.pixel_vertices: dict[int, np.ndarray] = {}
+        self.calibration_segment_by_frame: dict[int, int] = {}
+        self.area_id_by_frame: dict[int, int] = {}
+        self.field_m = FIELD_POINTS_M.copy()
+        self.estadio_query = estadio
+        self.estadio = buscar_estadio(estadio) if estadio else None
+        if self.estadio:
+            largo = self.estadio.get("largo_m")
+            ancho = self.estadio.get("ancho_m")
+            estado = self.estadio.get("estado_verificacion", "sin estado")
+            print(f"[AutoCalibrador] Estadio seleccionado: {self.estadio.get('nombre', estadio)} "
+                  f"({largo} x {ancho} m; estado: {estado}).")
+            print(f"[AutoCalibrador] Homografía local del área penal: "
+                  f"{ANCHO_AREA_M:.2f} x {ALTO_AREA_M:.2f} m, según estadios.json.")
+        else:
+            print(f"[AutoCalibrador] No se encontró el estadio '{estadio}' en estadios.json; "
+                  "se usarán las dimensiones IFAB del área penal.")
         self.mejor_frame = None
         self.mejores_puntos = None
-
-        if not Path(model_path).exists():
-            print(f"[AutoCalibrador] No se encontró el modelo: {model_path}")
-            return
-
-        try:
-            self.modelo = YOLO(str(model_path))
+        self._segment_counter = 0
+        path = Path(model_path)
+        if not path.exists():
+            print(f"[AutoCalibrador] No se encontró el modelo de keypoints: {path}. "
+                  "Se permitirá calibración manual.")
             self.enabled = True
-            print(f"[AutoCalibrador] Modelo cargado: {model_path.name}")
+            return
+        try:
+            self.modelo = YOLO(str(path))
+            self.enabled = True
+            print(f"[AutoCalibrador] Modelo de calibración cargado: {path}")
         except Exception as exc:
-            print(f"[AutoCalibrador] Error al cargar modelo: {exc}")
+            print(f"[AutoCalibrador] No se pudo cargar el modelo: {exc}")
 
-    # ---------------------------------------------------------------
-    # VALIDACIÓN GEOMÉTRICA
-    # ---------------------------------------------------------------
     @staticmethod
-    def _area_es_coherente(puntos_px):
-        """
-        Verifica que los 4 puntos formen un rectángulo razonable.
-        Devuelve True si pasa la validación.
-        """
-        if puntos_px is None or len(puntos_px) != 4:
+    def _area_es_coherente(points):
+        if points is None:
             return False
-
-        pts = np.asarray(puntos_px, dtype=np.float32)
-        if not np.isfinite(pts).all():
+        p = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+        if p.shape != (4, 2) or not np.isfinite(p).all():
             return False
-
-        # Área del polígono
-        area = abs(cv2.contourArea(pts))
-        if area < AREA_MIN_PX:
+        area = abs(float(cv2.contourArea(p)))
+        if area < MIN_POLYGON_AREA_PX:
             return False
-
-        # Lados: 0->1 (ancho), 1->2 (alto), 2->3 (ancho), 3->0 (alto)
-        lados = [
-            np.linalg.norm(pts[1] - pts[0]),
-            np.linalg.norm(pts[2] - pts[1]),
-            np.linalg.norm(pts[3] - pts[2]),
-            np.linalg.norm(pts[0] - pts[3]),
-        ]
-
-        if min(lados) < 1.0:
+        sides = [float(np.linalg.norm(p[(i + 1) % 4] - p[i])) for i in range(4)]
+        if min(sides) < 8.0:
             return False
-
-        ancho_px = (lados[0] + lados[2]) / 2.0
-        alto_px = (lados[1] + lados[3]) / 2.0
-
-        if alto_px < 1.0:
+        width_px = (sides[0] + sides[2]) / 2.0
+        depth_px = (sides[1] + sides[3]) / 2.0
+        if min(width_px, depth_px) <= 0:
             return False
-
-        aspecto = ancho_px / alto_px
-        if not (ASPECTO_MIN <= aspecto <= ASPECTO_MAX):
+        aspect = max(width_px, depth_px) / min(width_px, depth_px)
+        if not ASPECT_MIN <= aspect <= ASPECT_MAX:
             return False
-
-        # Verificar que no haya auto-intersección (polígono simple)
-        # Si el polígono se cruza, cv2.contourArea da un valor pequeño
-        # comparado con el área del bounding box.
-        x, y, w, h = cv2.boundingRect(pts)
-        bbox_area = float(w * h)
-        if bbox_area > 0 and area / bbox_area < 0.5:
-            # El polígono ocupa menos del 50% del bounding box:
-            # o está muy inclinado, o se auto-intersecta.
+        # Evita quadriláteros casi degenerados o autointersecados.
+        x, y, w, h = cv2.boundingRect(p)
+        if w <= 0 or h <= 0 or area / float(w * h) < 0.18:
             return False
-
         return True
 
-    # ---------------------------------------------------------------
-    # BÚSQUEDA DEL MEJOR FRAME
-    # ---------------------------------------------------------------
     def _leer_keypoints(self, frame):
-        resultados = self.modelo(frame, verbose=False)
-        if not resultados or resultados[0].keypoints is None:
+        if self.modelo is None:
             return None
-        kpts = resultados[0].keypoints.data.cpu().numpy()
-        if len(kpts.shape) == 3:
-            kpts = kpts[0]
-        return kpts
+        try:
+            results = self.modelo.predict(frame, verbose=False)
+            if not results or results[0].keypoints is None:
+                return None
+            kpts = results[0].keypoints.data.cpu().numpy()
+            if kpts.ndim == 3:
+                if kpts.shape[0] == 0:
+                    return None
+                kpts = kpts[0]
+            return kpts if kpts.ndim == 2 and kpts.shape[1] >= 3 else None
+        except Exception as exc:
+            print(f"[AutoCalibrador] Falló la detección de keypoints: {exc}")
+            return None
 
-    def _visibilidad_area(self, kpts):
-        """
-        Devuelve (score, puntos, indices) del área con mayor visibilidad
-        que además pase la validación geométrica.
-        """
-        mejor_score = -1.0
-        mejores_puntos = None
-        mejores_indices = None
-
-        for indices in KEYPOINTS_AREAS:
-            visibilidades = []
-            puntos = []
-            valido = True
-
-            for idx in indices:
-                if idx >= len(kpts):
-                    valido = False
-                    break
-                x, y, vis = kpts[idx]
-                visibilidades.append(float(vis))
-                puntos.append([float(x), float(y)])
-
-            if not valido:
+    def _mejor_area(self, frame):
+        kpts = self._leer_keypoints(frame)
+        if kpts is None:
+            return None
+        candidates = []
+        for area_id, indices in enumerate(KEYPOINTS_AREAS):
+            if max(indices) >= len(kpts):
                 continue
-
-            count_ok = sum(
-                v >= VISIBILIDAD_MIN_BUSQUEDA for v in visibilidades
-            )
-            if count_ok < 3:
+            selected = kpts[list(indices)]
+            visibility = selected[:, 2].astype(float)
+            points = selected[:, :2].astype(np.float32)
+            if not np.isfinite(selected).all():
                 continue
-
-            puntos_arr = np.array(puntos, dtype=np.float32)
-
-            # --- Validación geométrica ---
-            if not self._area_es_coherente(puntos_arr):
+            if int(np.sum(visibility >= VISIBILITY_MIN)) < 3:
                 continue
-
-            score = sum(visibilidades)
-            if count_ok == 4:
-                score += 1.0
-
-            if score > mejor_score:
-                mejor_score = score
-                mejores_puntos = puntos_arr
-                mejores_indices = indices
-
-        return mejor_score, mejores_puntos, mejores_indices
-
-    def _buscar_mejor_frame(self, frames):
-        mejor_score = -1.0
-        mejor_frame = None
-        mejores_puntos = None
-        mejores_indices = None
-
-        total = len(frames)
-        print(f"[AutoCalibrador] Buscando mejor frame en {total} frames "
-              f"(paso {PASO_BUSQUEDA})...")
-
-        frames_revisados = 0
-        frames_con_deteccion = 0
-
-        for frame_num in range(0, total, PASO_BUSQUEDA):
-            frames_revisados += 1
-            kpts = self._leer_keypoints(frames[frame_num])
-            if kpts is None:
+            # Cuatro puntos son necesarios para homografía; si uno tiene poca
+            # visibilidad, solo se acepta si el modelo igual lo localizó y la
+            # geometría completa pasa la validación. No se inventa el cuarto.
+            if float(np.min(visibility)) < 0.08:
                 continue
-
-            score, puntos, indices = self._visibilidad_area(kpts)
-            if puntos is None:
+            if not self._area_es_coherente(points):
                 continue
+            score = float(np.sum(np.clip(visibility, 0, 1)))
+            candidates.append((score, area_id, points))
+        if not candidates:
+            return None
+        _, area_id, points = max(candidates, key=lambda x: x[0])
+        return area_id, points
 
-            frames_con_deteccion += 1
+    def _buscar_mejor_frame(self, frames, paso=3):
+        best = None
+        for idx in range(0, len(frames), max(1, int(paso))):
+            candidate = self._mejor_area(frames[idx])
+            if candidate is None:
+                continue
+            area_id, points = candidate
+            score = abs(float(cv2.contourArea(points)))
+            if best is None or score > best[0]:
+                best = (score, idx, area_id, points)
+        if best is None:
+            # Modo híbrido seguro: no abrir una ventana que exija cuatro
+            # esquinas que no aparecen en pantalla. Detectamos marcas parciales
+            # para diagnóstico/seguimiento, pero no inventamos una homografía
+            # métrica a partir de líneas sin correspondencias de cancha conocidas.
+            try:
+                from detector_lineas_cancha import detectar_segmentos_cancha
+                frame_num = len(frames) // 2
+                segmentos = detectar_segmentos_cancha(frames[frame_num])
+                print(f"[AutoCalibrador] No hay cuatro keypoints válidos. "
+                      f"Detector híbrido encontró {len(segmentos)} segmentos de líneas "
+                      f"en frame {frame_num}; no se exige marcar cuatro esquinas.")
+                if segmentos:
+                    diagnostico = frames[frame_num].copy()
+                    for seg in segmentos:
+                        cv2.line(diagnostico, seg["p1"], seg["p2"], (0, 255, 255), 2)
+                    salida = BASE_DIR / "diagnostico_lineas_parciales.jpg"
+                    cv2.imwrite(str(salida), diagnostico)
+                    print(f"[AutoCalibrador] Diagnóstico de líneas guardado: {salida}")
+            except Exception as exc:
+                print(f"[AutoCalibrador] Detector de líneas parciales no disponible: {exc}")
+            print("[AutoCalibrador] No se puede calcular velocidad métrica fiable sin "
+                  "una referencia geométrica identificable. Se omite la calibración "
+                  "manual de cuatro esquinas para este video.")
+            return None, None, None
+        _, frame_num, area_id, points = best
+        self.mejor_frame, self.mejores_puntos = frame_num, points.copy()
+        print(f"[AutoCalibrador] Mejor frame: {frame_num}; área {area_id}; puntos válidos.")
+        return frame_num, area_id, points
 
-            if score > mejor_score:
-                mejor_score = score
-                mejor_frame = frame_num
-                mejores_puntos = puntos
-                mejores_indices = indices
-
-        print(f"[AutoCalibrador] Frames revisados: {frames_revisados}, "
-              f"con detección válida: {frames_con_deteccion}")
-
-        if mejor_frame is None:
-            print("[AutoCalibrador] No se encontró ningún frame con "
-                  "visibilidad y geometría suficientes.")
-            return None, None
-
-        print(f"[AutoCalibrador] Mejor frame: {mejor_frame} "
-              f"(score={mejor_score:.2f}, indices={mejores_indices})")
-        print(f"[AutoCalibrador] Puntos: {mejores_puntos.tolist()}")
-
-        self.mejor_frame = mejor_frame
-        self.mejores_puntos = mejores_puntos
-
-        return mejor_frame, mejores_puntos
-
-    # ---------------------------------------------------------------
-    # PROPAGACIÓN CON OPTICAL FLOW
-    # ---------------------------------------------------------------
-    def _guardar_homografia(self, frame_num, puntos_px):
-        if puntos_px is None or len(puntos_px) != 4:
+    def _guardar_homografia(self, frame_num, points, segment_id, area_id):
+        if not self._area_es_coherente(points):
             return False
-
-        puntos_px = np.asarray(puntos_px, dtype=np.float32).reshape(4, 2)
-        if not np.isfinite(puntos_px).all():
+        points = np.asarray(points, dtype=np.float32).reshape(4, 2)
+        H, inliers = cv2.findHomography(points, self.field_m, method=0)
+        if H is None or not np.isfinite(H).all() or abs(float(np.linalg.det(H))) < 1e-12:
             return False
-
-        H, _ = cv2.findHomography(puntos_px, self.field_m, cv2.RANSAC, 5.0)
-        if H is None or not np.isfinite(H).all():
+        # Reproyección de las cuatro esquinas: evita aceptar homografías malas.
+        mapped = cv2.perspectiveTransform(points.reshape(1, -1, 2), H).reshape(-1, 2)
+        if not np.isfinite(mapped).all() or np.max(np.linalg.norm(mapped - self.field_m, axis=1)) > 0.5:
             return False
-        if abs(np.linalg.det(H)) < 1e-12:
-            return False
-
-        self.homografias[frame_num] = H
-        self.pixel_vertices[frame_num] = puntos_px.copy()
+        self.homografias[int(frame_num)] = H
+        self.pixel_vertices[int(frame_num)] = points.copy()
+        self.calibration_segment_by_frame[int(frame_num)] = int(segment_id)
+        self.area_id_by_frame[int(frame_num)] = int(area_id)
         return True
 
-    def _propagar_adelante(self, frames, frame_inicial, puntos_iniciales):
-        gray_prev = cv2.cvtColor(
-            frames[frame_inicial], cv2.COLOR_BGR2GRAY
-        )
-        puntos = puntos_iniciales.copy()
-
-        for frame_num in range(frame_inicial + 1, len(frames)):
+    def _propagar_direccion(self, frames, anchor_frame, anchor_points, anchor_area, direction):
+        previous_idx = anchor_frame
+        previous_gray = cv2.cvtColor(frames[anchor_frame], cv2.COLOR_BGR2GRAY)
+        points = np.asarray(anchor_points, dtype=np.float32).copy()
+        area_id = int(anchor_area)
+        segment_id = 0
+        self._guardar_homografia(anchor_frame, points, segment_id, area_id)
+        step_count = 0
+        for frame_num in range(anchor_frame + direction, len(frames) if direction > 0 else -1, direction):
             gray = cv2.cvtColor(frames[frame_num], cv2.COLOR_BGR2GRAY)
-
-            nuevos, status, _ = cv2.calcOpticalFlowPyrLK(
-                gray_prev, gray,
-                puntos.reshape(-1, 1, 2),
-                None,
-                **LK_PARAMS,
-            )
-
-            if nuevos is None or status is None or status.sum() < 4:
-                gray_prev = gray
+            step_count += 1
+            redetected = self._mejor_area(frames[frame_num]) if step_count % REDETECT_EVERY == 0 else None
+            if redetected is not None:
+                new_area_id, new_points = redetected
+                # Cambiar entre áreas opuestas crea otro sistema local; nunca
+                # comparar velocidades cruzando esa discontinuidad.
+                if new_area_id != area_id:
+                    self._segment_counter += 1
+                    segment_id = self._segment_counter
+                    area_id = new_area_id
+                points = new_points.astype(np.float32)
+                self._guardar_homografia(frame_num, points, segment_id, area_id)
+                previous_gray = gray
+                previous_idx = frame_num
                 continue
 
-            puntos = nuevos.reshape(-1, 2).astype(np.float32)
-            self._guardar_homografia(frame_num, puntos)
-            gray_prev = gray
-
-    def _propagar_atras(self, frames, frame_inicial, puntos_iniciales):
-        gray_prev = cv2.cvtColor(
-            frames[frame_inicial], cv2.COLOR_BGR2GRAY
-        )
-        puntos = puntos_iniciales.copy()
-
-        for frame_num in range(frame_inicial - 1, -1, -1):
-            gray = cv2.cvtColor(frames[frame_num], cv2.COLOR_BGR2GRAY)
-
-            nuevos, status, _ = cv2.calcOpticalFlowPyrLK(
-                gray_prev, gray,
-                puntos.reshape(-1, 1, 2),
-                None,
-                **LK_PARAMS,
-            )
-
-            if nuevos is None or status is None or status.sum() < 4:
-                gray_prev = gray
+            try:
+                next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+                    previous_gray, gray, points.reshape(-1, 1, 2), None, **LK_PARAMS
+                )
+            except cv2.error:
+                next_points, status = None, None
+            if next_points is None or status is None or int(status.reshape(-1).sum()) < 4:
+                # No avanzar el frame de referencia sin mover también los puntos.
+                # En el siguiente paso se intentará el flujo desde la última
+                # geometría válida; si el salto es grande, se rechazará abajo.
+                direct = self._mejor_area(frames[frame_num])
+                if direct is not None:
+                    new_area_id, candidate = direct
+                    if new_area_id != area_id:
+                        self._segment_counter += 1
+                        segment_id = self._segment_counter
+                        area_id = new_area_id
+                    if self._guardar_homografia(frame_num, candidate, segment_id, area_id):
+                        points = candidate.astype(np.float32)
+                        previous_gray = gray
+                        previous_idx = frame_num
                 continue
+            candidate = next_points.reshape(-1, 2).astype(np.float32)
+            movement = np.linalg.norm(candidate - points, axis=1)
+            if not np.isfinite(candidate).all() or np.max(movement) > MAX_CORNER_STEP_PX:
+                # Posible corte/zoom fuerte: intentar detección directa en el frame.
+                direct = self._mejor_area(frames[frame_num])
+                if direct is None:
+                    previous_gray = gray
+                    previous_idx = frame_num
+                    continue
+                new_area_id, candidate = direct
+                if new_area_id != area_id:
+                    self._segment_counter += 1
+                    segment_id = self._segment_counter
+                    area_id = new_area_id
+            if self._guardar_homografia(frame_num, candidate, segment_id, area_id):
+                points = candidate
+                previous_gray = gray
+                previous_idx = frame_num
+            else:
+                previous_gray = gray
+                previous_idx = frame_num
 
-            puntos = nuevos.reshape(-1, 2).astype(np.float32)
-            self._guardar_homografia(frame_num, puntos)
-            gray_prev = gray
-
-    # ---------------------------------------------------------------
-    # API PÚBLICA
-    # ---------------------------------------------------------------
     def calibrar_frames(self, frames, cada_n=None):
-        if not self.enabled:
+        if not self.enabled or not frames:
             return 0
-
-        if not frames:
+        self.homografias.clear()
+        self.pixel_vertices.clear()
+        self.calibration_segment_by_frame.clear()
+        self.area_id_by_frame.clear()
+        anchor_frame, area_id, points = self._buscar_mejor_frame(frames, paso=cada_n or 3)
+        if anchor_frame is None:
+            self.enabled = False
             return 0
-
-        frame_inicial, puntos_iniciales = self._buscar_mejor_frame(frames)
-        if frame_inicial is None or puntos_iniciales is None:
+        self._segment_counter = 0
+        if not self._guardar_homografia(anchor_frame, points, 0, area_id):
+            print("[AutoCalibrador] La homografía inicial no superó validación.")
+            self.enabled = False
             return 0
-
-        if not self._guardar_homografia(frame_inicial, puntos_iniciales):
-            print("[AutoCalibrador] No se pudo calcular homografía inicial.")
-            return 0
-
-        print("[AutoCalibrador] Propagando con optical flow...")
-        self._propagar_adelante(frames, frame_inicial, puntos_iniciales)
-        self._propagar_atras(frames, frame_inicial, puntos_iniciales)
-
-        print(f"[AutoCalibrador] Homografías totales: "
-              f"{len(self.homografias)}/{len(frames)}")
-
+        # Propaga en ambos sentidos desde el mejor frame. Las redetecciones
+        # periódicas limitan la deriva del optical flow.
+        self._propagar_direccion(frames, anchor_frame, points, area_id, +1)
+        self._propagar_direccion(frames, anchor_frame, points, area_id, -1)
+        print(f"[AutoCalibrador] Homografías válidas: {len(self.homografias)}/{len(frames)} frames.")
+        if not self.homografias:
+            self.enabled = False
         return len(self.homografias)
 
     def _homografia_mas_cercana(self, frame_num):
         if not self.homografias:
-            return None, None
+            return None, None, None
+        frame_num = int(frame_num)
         if frame_num in self.homografias:
-            return (
-                self.homografias[frame_num],
-                self.pixel_vertices[frame_num],
-            )
-        frames_disp = sorted(self.homografias.keys())
-        mas_cercano = min(frames_disp, key=lambda f: abs(f - frame_num))
-        return (
-            self.homografias[mas_cercano],
-            self.pixel_vertices[mas_cercano],
-        )
+            return self.homografias[frame_num], self.pixel_vertices[frame_num], self.calibration_segment_by_frame.get(frame_num)
+        keys = sorted(self.homografias)
+        nearest = min(keys, key=lambda k: abs(k - frame_num))
+        # No reutilizar una homografía lejana: tras un corte o una oclusión
+        # puede ser geométricamente incorrecta.
+        if abs(nearest - frame_num) > 3:
+            return None, None, None
+        return self.homografias[nearest], self.pixel_vertices[nearest], self.calibration_segment_by_frame.get(nearest)
 
+    def get_calibration_segment(self, frame_num=0):
+        _, _, segment = self._homografia_mas_cercana(frame_num)
+        return segment
 
     def transform_point(self, point, frame_num=0):
-        """Transforma un punto de imagen a metros usando la homografía."""
-
-        if not self.enabled or point is None or not self.homografias:
+        if not self.enabled or point is None:
             return None
-
         try:
-            p = np.asarray(point, dtype=np.float32).reshape(-1)
-
-            if p.size < 2:
+            p = np.asarray(point, dtype=np.float32).reshape(-1)[:2]
+            if p.size != 2 or not np.isfinite(p).all():
                 return None
-
-            p = p[:2]
-
-            if not np.isfinite(p).all():
+            H, vertices, segment = self._homografia_mas_cercana(frame_num)
+            if H is None or vertices is None:
                 return None
-
-            H, _ = self._homografia_mas_cercana(frame_num)
-
-            if H is None or not np.isfinite(H).all():
-                return None
-
-            # No rechazar el balón por estar fuera del área penal.
-            # La homografía se puede extrapolar al resto de la cancha.
-            transformed = cv2.perspectiveTransform(
-                p.reshape(1, 1, 2),
-                H
-            ).reshape(2)
-
+            # No exigir que el balón esté dentro del área: la homografía puede
+            # extrapolarse localmente, pero la distancia pierde fiabilidad lejos
+            # de la zona calibrada. El filtrado temporal limita falsos saltos.
+            transformed = cv2.perspectiveTransform(p.reshape(1, 1, 2), H).reshape(2)
             if not np.isfinite(transformed).all():
                 return None
-
             return transformed.astype(float)
-
         except (ValueError, TypeError, IndexError, cv2.error):
             return None
 
-
     def add_transformed_position_to_tracks(self, tracks):
-        if not self.enabled or not self.homografias:
-            for _, object_tracks in tracks.items():
-                for frame_tracks in object_tracks:
-                    for item in frame_tracks.values():
-                        item["position_transformed"] = None
-            return
-
         for _, object_tracks in tracks.items():
             for frame_num, frame_tracks in enumerate(object_tracks):
                 for item in frame_tracks.values():
-                    pos = item.get("position")
                     item["position_transformed"] = self.transform_point(
-                        pos, frame_num=frame_num
+                        item.get("position"), frame_num=frame_num
                     )

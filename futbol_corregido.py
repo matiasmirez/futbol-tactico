@@ -10,7 +10,19 @@ import math
 import pickle
 from pathlib import Path
 from collections import Counter, defaultdict, deque
-from view_transformer_tramos import InterpolatedViewTransformer
+# Compatibilidad: algunas versiones del proyecto no incluyen la clase
+# InterpolatedViewTransformer en view_transformer_tramos.py. No impedir que
+# arranque todo el análisis por esa dependencia opcional.
+try:
+    from view_transformer_tramos import InterpolatedViewTransformer
+except (ImportError, AttributeError) as exc:
+    InterpolatedViewTransformer = None
+    print(
+        "[Calibración] Módulo de tramos no disponible o sin "
+        "InterpolatedViewTransformer; se usará el calibrador automático. "
+        f"Detalle: {exc}"
+    )
+
 from auto_calibrador import AutoCalibrador
 
 import cv2
@@ -42,7 +54,11 @@ VIDEO_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_VIDEO_PATH
 
 CLIP_NAME = VIDEO_PATH.stem
 
-MODEL_PATH = BASE_DIR / "models" / "best.pt"
+MODEL_PATH_CANDIDATES = [
+    BASE_DIR / "models" / "best.pt",
+    BASE_DIR / "modelos" / "Model" / "weights" / "best.pt",
+]
+MODEL_PATH = next((p for p in MODEL_PATH_CANDIDATES if p.exists()), MODEL_PATH_CANDIDATES[0])
 OUTPUT_DIR = BASE_DIR / "output_videos"
 STUBS_DIR = BASE_DIR / "stubs"
 
@@ -1044,13 +1060,23 @@ def load_view_transformer_tramos(
     Si existe calibracion_tramos.json, usa homografia interpolada por frame.
     Si no, cae al calibracion_cancha.json de siempre.
     """
-    if calibration_path.exists():
-        transformer = InterpolatedViewTransformer(calibration_path)
-        if transformer.enabled:
-            print("[Calibración] Modo tramos activo.")
-            return transformer
+    if calibration_path.exists() and InterpolatedViewTransformer is not None:
+        try:
+            transformer = InterpolatedViewTransformer(calibration_path)
+            if transformer.enabled:
+                print("[Calibración] Modo tramos activo.")
+                return transformer
+        except Exception as exc:
+            print(f"[Calibración] No se pudo cargar el modo tramos: {exc}")
 
-    print("[Calibración] Sin calibracion_tramos.json; uso el modo simple.")
+    if InterpolatedViewTransformer is None and calibration_path.exists():
+        print(
+            "[Calibración] Existe calibracion_tramos.json, pero la versión "
+            "actual de view_transformer_tramos.py no expone "
+            "InterpolatedViewTransformer. Se probará calibración simple/automática."
+        )
+    else:
+        print("[Calibración] Sin calibracion_tramos.json válido; uso el modo simple.")
     return load_view_transformer()
 
 
@@ -1736,6 +1762,48 @@ def nearest_rival_pairs(field_players, max_draw_distance):
 # ============================================================
 # VIDEO TÁCTICO
 # ============================================================
+def calcular_velocidad_metros(
+    posicion_actual,
+    posicion_anterior,
+    frames_transcurridos,
+    fps,
+    velocidad_maxima=45.0,
+):
+    """
+    Devuelve (m/s, km/h), o (None, None) si los datos no son fiables.
+    Las posiciones deben estar calibradas en metros.
+    """
+    if posicion_actual is None or posicion_anterior is None:
+        return None, None
+
+    if not np.isfinite(fps) or fps <= 0 or frames_transcurridos <= 0:
+        return None, None
+
+    actual = np.asarray(posicion_actual, dtype=float).reshape(-1)[:2]
+    anterior = np.asarray(posicion_anterior, dtype=float).reshape(-1)[:2]
+
+    if actual.size != 2 or anterior.size != 2:
+        return None, None
+
+    if not np.isfinite(actual).all() or not np.isfinite(anterior).all():
+        return None, None
+
+    dt = frames_transcurridos / fps
+
+    # Una separación demasiado larga no permite estimar bien
+    # la velocidad instantánea del balón.
+    if dt > 0.25:
+        return None, None
+
+    distancia_m = float(np.linalg.norm(actual - anterior))
+    velocidad_ms = distancia_m / dt
+
+    if not np.isfinite(velocidad_ms) or velocidad_ms > velocidad_maxima:
+        return None, None
+
+    return velocidad_ms, velocidad_ms * 3.6
+
+
 
 def create_tactical_video(
     frames,
@@ -1763,28 +1831,41 @@ def create_tactical_video(
     if not writer.isOpened():
         raise RuntimeError(f"No se pudo crear el video: {output_path}")
 
-    # --- Helper interno: transformar punto soportando ambos transformers ---
-
-    # --- Helper interno: transformar punto soportando ambos transformers ---
     def _transform(point, frame_num=0):
-        if view_transformer is None or not getattr(view_transformer, "enabled", False):
-            return None
-
-        if point is None:
+        if (
+            point is None
+            or view_transformer is None
+            or not getattr(view_transformer, "enabled", False)
+        ):
             return None
 
         try:
-            return view_transformer.transform_point(
-                point,
-                frame_num=frame_num
+            result = view_transformer.transform_point(
+                point, frame_num=frame_num
             )
         except TypeError:
-            # Compatibilidad con ViewTransformer antiguo,
-            # cuyo método solo recibe el punto.
-            return view_transformer.transform_point(point)
+            result = view_transformer.transform_point(point)
+
+        if result is None:
+            return None
+
+        result = np.asarray(result, dtype=float).reshape(-1)
+
+        if result.size < 2 or not np.isfinite(result[:2]).all():
+            return None
+
+        return result[:2]
+
     previous_positions = {}
+
+    # Estado del seguimiento de la pelota en coordenadas de cancha.
     previous_ball_world = None
     previous_ball_frame = None
+    previous_ball_segment = None
+
+    # Evita acumular velocidades inválidas después de perder el balón.
+    max_speed_ms = 45.0
+    max_gap_seconds = 0.25
 
     total = min(
         len(frames),
@@ -1802,7 +1883,9 @@ def create_tactical_video(
             players = tracks["players"][frame_num]
             balls = tracks["ball"][frame_num]
 
-            # --- Dibujar jugadores ---
+            # --------------------------------------------------
+            # JUGADORES
+            # --------------------------------------------------
             for track_id, player in players.items():
                 draw_player(
                     frame,
@@ -1811,7 +1894,9 @@ def create_tactical_video(
                     previous_positions,
                 )
 
-            # --- Balón ---
+            # --------------------------------------------------
+            # BALÓN
+            # --------------------------------------------------
             ball = balls.get(1, {})
             ball_pos = get_ball_position(ball)
 
@@ -1831,7 +1916,9 @@ def create_tactical_video(
                     cv2.LINE_AA,
                 )
 
-            # --- Posesión y análisis por frame ---
+            # --------------------------------------------------
+            # ANÁLISIS TÁCTICO
+            # --------------------------------------------------
             possession = int(team_ball_control[frame_num])
 
             analysis = analizar_jugada_en_frame(
@@ -1842,20 +1929,29 @@ def create_tactical_video(
                 height,
             )
 
-            formation_1 = estimate_formation(players, TEAM_ARGENTINA)
-            formation_2 = estimate_formation(players, TEAM_ENGLAND)
+            formation_1 = estimate_formation(
+                players, TEAM_ARGENTINA
+            )
+            formation_2 = estimate_formation(
+                players, TEAM_ENGLAND
+            )
 
-            compact_1 = estimate_compactness(players, TEAM_ARGENTINA)
-            compact_2 = estimate_compactness(players, TEAM_ENGLAND)
+            compact_1 = estimate_compactness(
+                players, TEAM_ARGENTINA
+            )
+            compact_2 = estimate_compactness(
+                players, TEAM_ENGLAND
+            )
 
-            # --- Jugadores de campo con posición estable y mundo ---
             field_players = build_field_player_positions(
                 players,
                 view_transformer,
                 frame_num=frame_num,
             )
 
-            # --- Pares más cercanos entre rivales ---
+            # --------------------------------------------------
+            # DISTANCIAS ENTRE RIVALES
+            # --------------------------------------------------
             pairs = nearest_rival_pairs(
                 field_players,
                 max_draw_distance=width * 0.105,
@@ -1879,8 +1975,10 @@ def create_tactical_video(
                 cv2.putText(
                     frame,
                     label[:95],
-                    (max(5, min(width - 400, cx)),
-                     max(18, min(height - 5, cy))),
+                    (
+                        max(5, min(width - 400, cx)),
+                        max(18, min(height - 5, cy)),
+                    ),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.36,
                     YELLOW,
@@ -1888,60 +1986,140 @@ def create_tactical_video(
                     cv2.LINE_AA,
                 )
 
-            # --- Balón en metros si hay calibración ---
-            ball_world = None
-            if ball_pos is not None:
-                ball_world = _transform(ball_pos, frame_num)
+            # --------------------------------------------------
+            # CALIBRACIÓN DEL BALÓN
+            # --------------------------------------------------
+            ball_world = _transform(ball_pos, frame_num)
+            segment_getter = getattr(view_transformer, "get_calibration_segment", None)
+            current_ball_segment = (
+                segment_getter(frame_num)
+                if callable(segment_getter)
+                else None
+            )
 
-            # --- Velocidad del balón ---
             speed_ms = None
-            if ball_world is not None:
-                ball_world = np.asarray(ball_world, dtype=float)
+            speed_kmh = None
 
-                if (
-                    previous_ball_world is not None
-                    and previous_ball_frame is not None
-                ):
-                    dt = (frame_num - previous_ball_frame) / fps
-
-                    if dt > 0:
-                        speed_ms = float(
-                            np.linalg.norm(ball_world - previous_ball_world) / dt
-                        )
-
-                previous_ball_world = ball_world
-                previous_ball_frame = frame_num
-            else:
+            # Si cambia el área/plano usado para calibrar, no calcular velocidad
+            # entre coordenadas de dos sistemas locales diferentes.
+            if (
+                current_ball_segment is not None
+                and previous_ball_segment is not None
+                and current_ball_segment != previous_ball_segment
+            ):
                 previous_ball_world = None
                 previous_ball_frame = None
 
-            # --- Distancias de los 3 jugadores más cercanos al balón ---
-            if ball_pos is not None:
-                near_ball = sorted(
-                    (
-                        math.hypot(
-                            p["x"] - ball_pos[0],
-                            p["y"] - ball_pos[1],
-                        ),
-                        p,
-                    )
-                    for p in field_players
-                )[:3]
+            if ball_world is None:
+                # No usar la posición anterior después de perder
+                # la detección o la calibración.
+                previous_ball_world = None
+                previous_ball_frame = None
+                previous_ball_segment = None
 
-                for i, (dpx, player) in enumerate(near_ball):
-                    label = (
-                        f"E{player['team']}-J{player['id']} balón: "
-                        f"{dpx:.0f} px"
-                    )
+            else:
+                ball_world = np.asarray(
+                    ball_world, dtype=float
+                ).reshape(-1)[:2]
 
-                    if ball_world is not None and player["world"] is not None:
-                        distance_m = float(np.linalg.norm(
-                            np.asarray(player["world"], dtype=float) - ball_world
-                        ))
-                        label = (
-                            f"E{player['team']}-J{player['id']} balón: "
-                            f"{distance_m:.1f} m"
+                if (
+                    ball_world.size != 2
+                    or not np.isfinite(ball_world).all()
+                ):
+                    previous_ball_world = None
+                    previous_ball_frame = None
+                    previous_ball_segment = None
+                    ball_world = None
+
+                else:
+                    if (
+                        previous_ball_world is not None
+                        and previous_ball_frame is not None
+                    ):
+                        frames_elapsed = (
+                            frame_num - previous_ball_frame
                         )
+                        dt = frames_elapsed / fps
+
+                        # Solo calcular si las detecciones están
+                        # suficientemente próximas en el tiempo.
+                        if (
+                            frames_elapsed > 0
+                            and 0 < dt <= max_gap_seconds
+                        ):
+                            distance_m = float(
+                                np.linalg.norm(
+                                    ball_world - previous_ball_world
+                                )
+                            )
+
+                            candidate_speed = distance_m / dt
+
+                            # Filtrar saltos de detección y errores
+                            # geométricos que producen valores absurdos.
+                            if (
+                                np.isfinite(candidate_speed)
+                                and 0 <= candidate_speed <= max_speed_ms
+                            ):
+                                speed_ms = candidate_speed
+                                speed_kmh = candidate_speed * 3.6
+                            else:
+                                # Un salto imposible invalida el tramo; no lo
+                                # usamos para calcular la siguiente velocidad.
+                                previous_ball_world = None
+                                previous_ball_frame = None
+
+                    # Guardar esta detección como nueva referencia solo si es
+                    # finita. El cálculo siguiente vuelve a requerir dt válido.
+                    if ball_world is not None:
+                        previous_ball_world = ball_world.copy()
+                        previous_ball_frame = frame_num
+                        previous_ball_segment = current_ball_segment
+
+            # --------------------------------------------------
+            # JUGADORES MÁS CERCANOS AL BALÓN
+            # --------------------------------------------------
+            if ball_pos is not None:
+                near_ball = []
+
+                for player in field_players:
+                    distance_px = math.hypot(
+                        player["x"] - ball_pos[0],
+                        player["y"] - ball_pos[1],
+                    )
+                    near_ball.append((distance_px, player))
+
+                near_ball.sort(key=lambda item: item[0])
+
+                for i, (distance_px, player) in enumerate(near_ball[:3]):
+                    label = (
+                        f"E{player['team']}-J{player['id']} "
+                        f"balon: {distance_px:.0f} px"
+                    )
+
+                    player_world = player.get("world")
+
+                    if (
+                        ball_world is not None
+                        and player_world is not None
+                    ):
+                        player_world = np.asarray(
+                            player_world, dtype=float
+                        ).reshape(-1)[:2]
+
+                        if (
+                            player_world.size == 2
+                            and np.isfinite(player_world).all()
+                        ):
+                            distance_m = float(
+                                np.linalg.norm(
+                                    player_world - ball_world
+                                )
+                            )
+                            label = (
+                                f"E{player['team']}-J{player['id']} "
+                                f"balon: {distance_m:.1f} m"
+                            )
 
                     cv2.putText(
                         frame,
@@ -1954,40 +2132,80 @@ def create_tactical_video(
                         cv2.LINE_AA,
                     )
 
-            # --- Texto de velocidad del balón ---
+            # --------------------------------------------------
+            # VELOCIDAD DEL BALÓN
+            # --------------------------------------------------
             if speed_ms is not None:
                 speed_text = (
-                    f"Velocidad estimada balón: {speed_ms:.1f} m/s "
-                    f"({speed_ms * 3.6:.1f} km/h)"
+                    f"Velocidad estimada del balon: "
+                    f"{speed_ms:.1f} m/s "
+                    f"({speed_kmh:.1f} km/h)"
                 )
-            elif view_transformer is not None and getattr(view_transformer, "enabled", False):
-                speed_text = "Velocidad balón: sin datos suficientes"
-            else:
-                speed_text = "Velocidad en m/s: requiere calibración"
 
-            # --- Texto de posesión ---
+            elif (
+                view_transformer is not None
+                and getattr(view_transformer, "enabled", False)
+            ):
+                speed_text = (
+                    "Velocidad del balon: "
+                    "sin datos metricos fiables"
+                )
+
+            else:
+                speed_text = (
+                    "Velocidad del balon: "
+                    "requiere calibracion"
+                )
+
+            # --------------------------------------------------
+            # PANEL TÁCTICO
+            # --------------------------------------------------
             if possession in (TEAM_ARGENTINA, TEAM_ENGLAND):
-                possession_text = f"Posesión estimada: Equipo {possession}"
+                possession_text = (
+                    f"Posesion estimada: Equipo {possession}"
+                )
             else:
-                possession_text = "Posesión: sin determinar"
+                possession_text = "Posesion: sin determinar"
 
-            # --- Panel lateral superior izquierdo ---
+            calibrated = (
+                view_transformer is not None
+                and getattr(view_transformer, "enabled", False)
+                and (
+                    not hasattr(view_transformer, "homografias")
+                    or bool(getattr(view_transformer, "homografias", {}))
+                )
+            )
+
             panel_lines = [
-                ("ANÁLISIS TÁCTICO (ESTIMACIONES)", WHITE),
-                (possession_text, TEAM_COLORS.get(possession, WHITE)),
-                (f"E1 formación: {formation_1}", TEAM_COLORS[TEAM_ARGENTINA]),
-                (f"E2 formación: {formation_2}", TEAM_COLORS[TEAM_ENGLAND]),
-                (f"E1 dispersión: {compact_1}", TEAM_COLORS[TEAM_ARGENTINA]),
-                (f"E2 dispersión: {compact_2}", TEAM_COLORS[TEAM_ENGLAND]),
+                ("ANALISIS TACTICO (ESTIMACIONES)", WHITE),
                 (
-                    "Distancias: metros calibrados"
-                    if view_transformer is not None
-                    and getattr(view_transformer, "enabled", False)
-                    else "Distancias: píxeles; falta calibrar",
+                    possession_text,
+                    TEAM_COLORS.get(possession, WHITE),
+                ),
+                (
+                    f"E1 formacion: {formation_1}",
+                    TEAM_COLORS[TEAM_ARGENTINA],
+                ),
+                (
+                    f"E2 formacion: {formation_2}",
+                    TEAM_COLORS[TEAM_ENGLAND],
+                ),
+                (
+                    f"E1 dispersion: {compact_1}",
+                    TEAM_COLORS[TEAM_ARGENTINA],
+                ),
+                (
+                    f"E2 dispersion: {compact_2}",
+                    TEAM_COLORS[TEAM_ENGLAND],
+                ),
+                (
+                    "Distancias: calibracion disponible"
+                    if calibrated
+                    else "Distancias: pixeles; falta calibrar",
                     WHITE,
                 ),
                 (
-                    "MODO REVISION: eventos candidatos, no veredictos"
+                    "MODO REVISION: eventos candidatos"
                     if defensive_alerts_presentes
                     else "MODO REVISION: sin eventos en este tramo",
                     WHITE,
@@ -2001,7 +2219,10 @@ def create_tactical_video(
             cv2.rectangle(
                 frame,
                 (10, 10),
-                (10 + panel_w, min(height - 5, 10 + panel_h)),
+                (
+                    10 + panel_w,
+                    min(height - 5, 10 + panel_h),
+                ),
                 DARK,
                 cv2.FILLED,
             )
@@ -2021,60 +2242,120 @@ def create_tactical_video(
                 )
                 y += 22
 
+            # --------------------------------------------------
+            # EVENTOS TÁCTICOS
+            # --------------------------------------------------
             time_s = frame_num / fps
 
-            # --- Evento activo (ventana de tiempo del evento) ---
             active_event = next(
                 (
-                    event for event in events
-                    if float(event.get("inicio_seconds", 1e12)) <= time_s
-                    <= float(event.get("fin_seconds", -1)) + 0.65
+                    event
+                    for event in events
+                    if float(
+                        event.get("inicio_seconds", 1e12)
+                    ) <= time_s
+                    <= float(
+                        event.get("fin_seconds", -1)
+                    ) + 0.65
                 ),
                 None,
             )
 
             if active_event:
-                tipo = str(active_event.get("tipo_evento", "evento")).lower()
+                tipo = str(
+                    active_event.get("tipo_evento", "evento")
+                ).lower()
 
                 etiquetas = {
-                    "intercepcion_defensiva_posible": "CANDIDATO: posible intercepcion",
-                    "pase_filtrado_posible": "CANDIDATO: posible pase filtrado",
-                    "error_defensivo_posible": "CANDIDATO: receptor con espacio",
-                    "pase_completado_posible": "CANDIDATO: pase completado",
-                    "receptor_libre_posible": "CANDIDATO: receptor libre",
+                    "intercepcion_defensiva_posible":
+                        "CANDIDATO: posible intercepcion",
+                    "pase_filtrado_posible":
+                        "CANDIDATO: posible pase filtrado",
+                    "error_defensivo_posible":
+                        "CANDIDATO: receptor con espacio",
+                    "pase_completado_posible":
+                        "CANDIDATO: pase completado",
+                    "receptor_libre_posible":
+                        "CANDIDATO: receptor libre",
                 }
-                title = etiquetas.get(tipo, "CANDIDATO A REVISAR")
 
-                # --- Distancias y velocidad en metros si hay calibración ---
+                title = etiquetas.get(
+                    tipo, "CANDIDATO A REVISAR"
+                )
+
                 def _fmt(valor, unidad):
                     if valor in ("", None):
                         return None
+
                     try:
-                        return f"{float(valor):.1f} {unidad}"
+                        numero = float(valor)
+                        if not np.isfinite(numero):
+                            return None
+                        return f"{numero:.1f} {unidad}"
                     except (TypeError, ValueError):
                         return None
 
-                dist_pase_m = _fmt(active_event.get("distancia_pase_m"), "m")
-                dist_pase_px = _fmt(active_event.get("distancia_pase_px"), "px")
-                dist_def_m = _fmt(active_event.get("distancia_defensor_receptor_m"), "m")
-                dist_def_px = _fmt(active_event.get("distancia_defensor_receptor_px"), "px")
-                vel_px = _fmt(active_event.get("velocidad_pase_px_s"), "px/s")
-                vel_m = _fmt(active_event.get("velocidad_pase_m_s"), "m/s")
-                vel_kmh = _fmt(active_event.get("velocidad_pase_km_h"), "km/h")
+                dist_pase_m = _fmt(
+                    active_event.get("distancia_pase_m"), "m"
+                )
+                dist_pase_px = _fmt(
+                    active_event.get("distancia_pase_px"), "px"
+                )
+                dist_def_m = _fmt(
+                    active_event.get(
+                        "distancia_defensor_receptor_m"
+                    ),
+                    "m",
+                )
+                dist_def_px = _fmt(
+                    active_event.get(
+                        "distancia_defensor_receptor_px"
+                    ),
+                    "px",
+                )
+                # La velocidad en px/s no es una velocidad física.
+                # No se muestra como sustituto de m/s cuando falta calibración.
+                vel_px = None
+                vel_m = _fmt(
+                    active_event.get("velocidad_pase_m_s"),
+                    "m/s",
+                )
+                vel_kmh = _fmt(
+                    active_event.get("velocidad_pase_km_h"),
+                    "km/h",
+                )
 
                 lineas = []
+
                 if dist_pase_m:
-                    lineas.append(f"Distancia del pase: {dist_pase_m}")
+                    lineas.append(
+                        f"Distancia del pase: {dist_pase_m}"
+                    )
                 elif dist_pase_px:
-                    lineas.append(f"Distancia del pase: {dist_pase_px} (sin calibrar)")
+                    lineas.append(
+                        f"Distancia del pase: {dist_pase_px} "
+                        "(sin calibrar)"
+                    )
+
                 if dist_def_m:
-                    lineas.append(f"Defensor-receptor: {dist_def_m}")
+                    lineas.append(
+                        f"Defensor-receptor: {dist_def_m}"
+                    )
                 elif dist_def_px:
-                    lineas.append(f"Defensor-receptor: {dist_def_px} (sin calibrar)")
+                    lineas.append(
+                        f"Defensor-receptor: {dist_def_px} "
+                        "(sin calibrar)"
+                    )
+
                 if vel_m:
-                    lineas.append(f"Velocidad del pase: {vel_m}" + (f" ({vel_kmh})" if vel_kmh else ""))
-                elif vel_px:
-                    lineas.append(f"Velocidad del pase: {vel_px} (sin calibrar)")
+                    lineas.append(
+                        f"Velocidad del pase: {vel_m}"
+                        + (f" ({vel_kmh})" if vel_kmh else "")
+                    )
+                elif active_event.get("velocidad_pase_px_s") not in (None, ""):
+                    lineas.append(
+                        "Velocidad del pase: calibración métrica pendiente"
+                    )
 
                 ey = min(max(200, height - 90), height - 70)
                 alto_caja = 30 + 22 * (1 + len(lineas))
@@ -2082,7 +2363,10 @@ def create_tactical_video(
                 cv2.rectangle(
                     frame,
                     (10, ey),
-                    (min(width - 10, 950), min(height - 5, ey + alto_caja)),
+                    (
+                        min(width - 10, 950),
+                        min(height - 5, ey + alto_caja),
+                    ),
                     DARK,
                     cv2.FILLED,
                 )
@@ -2099,6 +2383,7 @@ def create_tactical_video(
                 )
 
                 y_txt = ey + 44
+
                 for linea in lineas[:4]:
                     cv2.putText(
                         frame,
@@ -2112,7 +2397,6 @@ def create_tactical_video(
                     )
                     y_txt += 22
 
-            # --- Análisis heurístico por frame (si no hay evento activo) ---
             elif analysis is not None:
                 title, detail, color = analysis
                 ey = min(220, max(10, height - 70))
@@ -2120,7 +2404,10 @@ def create_tactical_video(
                 cv2.rectangle(
                     frame,
                     (10, ey),
-                    (min(width - 10, 740), min(height - 5, ey + 52)),
+                    (
+                        min(width - 10, 740),
+                        min(height - 5, ey + 52),
+                    ),
                     DARK,
                     cv2.FILLED,
                 )
@@ -2147,7 +2434,9 @@ def create_tactical_video(
                     cv2.LINE_AA,
                 )
 
-            # --- Reloj y contador de frames ---
+            # --------------------------------------------------
+            # RELOJ Y EXPORTACIÓN
+            # --------------------------------------------------
             minutes = int(time_s // 60)
             seconds = int(time_s % 60)
 
@@ -2166,12 +2455,16 @@ def create_tactical_video(
             writer.write(frame)
 
             if (frame_num + 1) % 100 == 0:
-                print(f"Video táctico: {frame_num + 1}/{total}")
+                print(
+                    f"Video tactico: {frame_num + 1}/{total}"
+                )
 
     finally:
         writer.release()
 
-    print(f"Video táctico generado: {output_path}")
+    print(f"Video tactico generado: {output_path}")
+
+
 
 def load_auto_calibrador():
     """
@@ -2305,7 +2598,17 @@ def main():
     # Esto recorre el video con YOLO y guarda una homografía por frame
     # (o cada N frames). Si no se detecta el área, cae al modo tramos.
     if hasattr(view_transformer, "calibrar_frames"):
-        view_transformer.calibrar_frames(frames)
+        calibraciones_validas = view_transformer.calibrar_frames(frames)
+        if not calibraciones_validas:
+            print(
+                "[Calibración] El calibrador automático no consiguió "
+                "homografías válidas; se intentará calibración manual/tramos."
+            )
+            fallback_transformer = load_view_transformer_tramos()
+            if getattr(fallback_transformer, "enabled", False):
+                view_transformer = fallback_transformer
+            else:
+                view_transformer = fallback_transformer
 
     view_transformer.add_transformed_position_to_tracks(tracks)
     # ------------------------------------------------------------------

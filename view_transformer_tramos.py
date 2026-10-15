@@ -1,318 +1,90 @@
-
+"""Transformador métrico por tramos para calibracion_tramos.json.
+Compatible con marcar_cancha_tramos.py y futbol_corregido.py.
 """
-view_transformer_tramos.py
-
-Transforma coordenadas de píxeles a metros usando calibraciones
-guardadas en calibracion_tramos.json.
-
-Interpola los cuatro vértices de la cancha entre calibraciones
-conocidas y recalcula la homografía para cada frame.
-
-Interfaz compatible con futbol_corregido.py:
-    enabled
-    transform_point(point, frame_num=0)
-    add_transformed_position_to_tracks(tracks)
-"""
-
 from pathlib import Path
 import json
-
 import cv2
 import numpy as np
 
 
-BASE_DIR = Path(__file__).resolve().parent
-
-FIELD_POINTS_DEFAULT = np.array(
-    [
-        [0.0, 0.0],
-        [105.0, 0.0],
-        [105.0, 68.0],
-        [0.0, 68.0],
-    ],
-    dtype=np.float32,
-)
-
-
 class InterpolatedViewTransformer:
-    def __init__(self, calibration_path=None):
+    def __init__(self, calibration_path):
+        self.calibration_path = Path(calibration_path)
+        with self.calibration_path.open('r', encoding='utf-8') as f:
+            data = json.load(f)
+
         self.enabled = False
-        self.calibration_path = Path(
-            calibration_path or BASE_DIR / "calibracion_tramos.json"
-        )
+        self.homografias = {}
+        self._frames = []
+        self._Hs = []
+        self._segment_ids = []
+        self.fps = float(data.get('fps') or 0)
+        vertices_m = data.get('field_vertices_m')
+        calibraciones = data.get('calibraciones')
+        if not isinstance(vertices_m, list) or len(vertices_m) != 4:
+            raise ValueError("field_vertices_m debe contener cuatro puntos.")
+        if not isinstance(calibraciones, list) or not calibraciones:
+            raise ValueError("calibraciones está vacío.")
 
-        self.calibraciones = []
-        self.field_vertices_m = FIELD_POINTS_DEFAULT.copy()
-        self._cache = {}
+        dst = np.asarray(vertices_m, dtype=np.float32).reshape(4, 2)
+        prev_frame = -1
+        for idx, cal in enumerate(calibraciones):
+            frame = int(cal.get('frame', round(float(cal.get('time_seconds', 0)) * self.fps)))
+            src = np.asarray(cal.get('pixel_vertices'), dtype=np.float32)
+            if src.shape != (4, 2) or not np.isfinite(src).all():
+                continue
+            if frame <= prev_frame:
+                raise ValueError("Los frames de calibración deben ser crecientes y únicos.")
+            if abs(cv2.contourArea(src)) < 100 or not cv2.isContourConvex(src.astype(np.int32)):
+                continue
+            H = cv2.getPerspectiveTransform(src, dst)
+            if not np.isfinite(H).all() or abs(np.linalg.det(H)) < 1e-12:
+                continue
+            self._frames.append(frame)
+            self._Hs.append(H)
+            self._segment_ids.append(idx)
+            self.homografias[frame] = H
+            prev_frame = frame
 
-        self._cargar()
+        if not self._frames:
+            raise ValueError("No hay homografías válidas en calibracion_tramos.json.")
+        self.enabled = True
 
-    def _cargar(self):
-        if not self.calibration_path.exists():
-            print(
-                "[Calibración por tramos] No existe: "
-                f"{self.calibration_path}"
-            )
-            return
-
-        try:
-            with self.calibration_path.open(
-                "r", encoding="utf-8"
-            ) as archivo:
-                data = json.load(archivo)
-
-            if not isinstance(data, dict):
-                raise ValueError(
-                    "El JSON debe contener un objeto."
-                )
-
-            field = data.get(
-                "field_vertices_m",
-                data.get(
-                    "field_points_m",
-                    data.get("field_vertices", FIELD_POINTS_DEFAULT.tolist()),
-                ),
-            )
-
-            field = np.asarray(field, dtype=np.float32)
-
-            if field.shape != (4, 2) or not np.isfinite(field).all():
-                raise ValueError(
-                    "'field_vertices_m' debe tener cuatro puntos [x, y]."
-                )
-
-            self.field_vertices_m = field
-
-            # Admite distintos nombres para la lista de calibraciones.
-            lista = None
-            for clave in (
-                "tramos",
-                "calibraciones",
-                "keyframes",
-                "calibration_points",
-                "frames",
-            ):
-                if isinstance(data.get(clave), list):
-                    lista = data[clave]
-                    break
-
-            # También permite que el JSON contenga directamente
-            # una lista de calibraciones.
-            if lista is None and isinstance(data, list):
-                lista = data
-
-            if not lista:
-                raise ValueError(
-                    "No se encontró una lista de calibraciones "
-                    "(tramos o calibraciones)."
-                )
-
-            calibraciones = []
-
-            for item in lista:
-                if not isinstance(item, dict):
-                    continue
-
-                frame = item.get(
-                    "frame_num",
-                    item.get(
-                        "frame",
-                        item.get(
-                            "numero_frame",
-                            item.get("n_frame"),
-                        ),
-                    ),
-                )
-
-                pixels = item.get(
-                    "pixel_vertices",
-                    item.get(
-                        "pixels",
-                        item.get("vertices_px"),
-                    ),
-                )
-
-                if frame is None or pixels is None:
-                    continue
-
-                pixels = np.asarray(pixels, dtype=np.float32)
-
-                if (
-                    pixels.shape != (4, 2)
-                    or not np.isfinite(pixels).all()
-                ):
-                    continue
-
-                # Cada punto debe ser distinto.
-                if len(np.unique(pixels, axis=0)) != 4:
-                    continue
-
-                calibraciones.append(
-                    {
-                        "frame": int(frame),
-                        "pixels": pixels,
-                    }
-                )
-
-            calibraciones.sort(key=lambda c: c["frame"])
-
-            if not calibraciones:
-                raise ValueError(
-                    "No hay calibraciones válidas con frame y "
-                    "cuatro pixel_vertices."
-                )
-
-            # Si hay varios registros del mismo frame, conserva el último.
-            unicas = {}
-            for calibracion in calibraciones:
-                unicas[calibracion["frame"]] = calibracion
-
-            self.calibraciones = sorted(
-                unicas.values(),
-                key=lambda c: c["frame"],
-            )
-
-            self._cache.clear()
-            self.enabled = True
-
-            print(
-                "[Calibración por tramos] Cargadas "
-                f"{len(self.calibraciones)} calibraciones."
-            )
-            print(
-                "[Calibración por tramos] Rango de frames: "
-                f"{self.calibraciones[0]['frame']}–"
-                f"{self.calibraciones[-1]['frame']}."
-            )
-
-        except (OSError, ValueError, TypeError, KeyError,
-                json.JSONDecodeError) as exc:
-            self.enabled = False
-            print(
-                "[Calibración por tramos] Error leyendo JSON: "
-                f"{exc}"
-            )
-
-    def _vertices_para_frame(self, frame_num):
-        if not self.calibraciones:
+    def get_calibration_segment(self, frame_num=0):
+        if not self._frames:
             return None
+        frame = int(frame_num)
+        # El identificador cambia en cada calibración para evitar velocidades
+        # entre sistemas locales cuando la cámara cambia de posición.
+        i = int(np.searchsorted(self._frames, frame, side='right') - 1)
+        i = max(0, min(i, len(self._frames) - 1))
+        return self._segment_ids[i]
 
-        frame_num = int(frame_num)
-
-        if frame_num in self._cache:
-            return self._cache[frame_num][0]
-
-        # Antes de la primera calibración: usar la primera.
-        if frame_num <= self.calibraciones[0]["frame"]:
-            return self.calibraciones[0]["pixels"].copy()
-
-        # Después de la última: usar la última.
-        if frame_num >= self.calibraciones[-1]["frame"]:
-            return self.calibraciones[-1]["pixels"].copy()
-
-        for i in range(len(self.calibraciones) - 1):
-            a = self.calibraciones[i]
-            b = self.calibraciones[i + 1]
-
-            if a["frame"] <= frame_num <= b["frame"]:
-                intervalo = b["frame"] - a["frame"]
-
-                if intervalo <= 0:
-                    return a["pixels"].copy()
-
-                alpha = (
-                    (frame_num - a["frame"]) / intervalo
-                )
-
-                vertices = (
-                    a["pixels"] * (1.0 - alpha)
-                    + b["pixels"] * alpha
-                )
-
-                return vertices.astype(np.float32)
-
-        return None
-
-    def _homografia_para_frame(self, frame_num):
-        frame_num = int(frame_num)
-
-        if frame_num in self._cache:
-            return self._cache[frame_num][1]
-
-        pixels = self._vertices_para_frame(frame_num)
-
-        if pixels is None:
-            return None
-
-        # Rechazar cuadriláteros degenerados.
-        area = abs(cv2.contourArea(pixels))
-
-        if area < 10.0:
-            return None
-
-        H = cv2.getPerspectiveTransform(
-            pixels.astype(np.float32),
-            self.field_vertices_m.astype(np.float32),
-        )
-
-        if not np.isfinite(H).all():
-            return None
-
-        if abs(float(np.linalg.det(H))) < 1e-12:
-            return None
-
-        self._cache[frame_num] = (pixels, H)
-        return H
+    def _homography_for_frame(self, frame_num):
+        frame = int(frame_num or 0)
+        i = int(np.searchsorted(self._frames, frame, side='right') - 1)
+        if i < 0:
+            i = 0
+        # Use nearest earlier calibration. Do not interpolate homography matrices:
+        # that can produce unstable/projectively invalid transforms.
+        return self._Hs[i]
 
     def transform_point(self, point, frame_num=0):
         if not self.enabled or point is None:
             return None
-
-        try:
-            p = np.asarray(
-                point, dtype=np.float32
-            ).reshape(-1)
-
-            if p.size < 2 or not np.isfinite(p[:2]).all():
-                return None
-
-            H = self._homografia_para_frame(frame_num)
-
-            if H is None:
-                return None
-
-            resultado = cv2.perspectiveTransform(
-                p[:2].reshape(1, 1, 2),
-                H,
-            ).reshape(2)
-
-            if not np.isfinite(resultado).all():
-                return None
-
-            return resultado.astype(float)
-
-        except (ValueError, TypeError, cv2.error):
+        p = np.asarray(point, dtype=np.float32).reshape(-1)
+        if p.size < 2 or not np.isfinite(p[:2]).all():
             return None
+        H = self._homography_for_frame(frame_num)
+        out = cv2.perspectiveTransform(p[:2].reshape(1, 1, 2), H).reshape(2)
+        if not np.isfinite(out).all():
+            return None
+        return out.astype(float)
 
     def add_transformed_position_to_tracks(self, tracks):
-        if not isinstance(tracks, dict):
-            return
-
-        for _, object_tracks in tracks.items():
-            if not isinstance(object_tracks, (list, tuple)):
-                continue
-
-            for frame_num, frame_tracks in enumerate(object_tracks):
-                if not isinstance(frame_tracks, dict):
-                    continue
-
+        for object_tracks in tracks.values():
+            for frame_idx, frame_tracks in enumerate(object_tracks):
                 for item in frame_tracks.values():
-                    if not isinstance(item, dict):
-                        continue
-
-                    item["position_transformed"] = (
-                        self.transform_point(
-                            item.get("position"),
-                            frame_num=frame_num,
-                        )
+                    item['position_transformed'] = self.transform_point(
+                        item.get('position'), frame_num=frame_idx
                     )

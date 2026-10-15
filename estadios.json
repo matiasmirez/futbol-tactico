@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "descripcion": "Base extensible de campos de fútbol. Solo incluir dimensiones verificadas y guardar fuente/fecha.",
+  "reglas_ifab": {
+    "area_penal_ancho_m": 40.32,
+    "area_penal_profundidad_m": 16.5,
+    "area_meta_ancho_m": 18.32,
+    "area_meta_profundidad_m": 5.5,
+    "punto_penal_m_desde_linea_gol": 11.0,
+    "arco_ancho_m": 7.32,
+    "arco_alto_m": 2.44,
+    "circulo_central_radio_m": 9.15,
+    "campo_largo_min_m": 90.0,
+    "campo_largo_max_m": 120.0,
+    "campo_ancho_min_m": 45.0,
+    "campo_ancho_max_m": 90.0,
+    "campo_largo_partidos_internacionales_min_m": 100.0,
+    "campo_largo_partidos_internacionales_max_m": 110.0,
+    "campo_ancho_partidos_internacionales_min_m": 64.0,
+    "campo_ancho_partidos_internacionales_max_m": 75.0
+  },
+  "estadios": [
+    {
+      "id": "estadio_jalisco_guadalajara",
+      "nombre": "Estadio Jalisco",
+      "ciudad": "Guadalajara",
+      "pais": "México",
+      "campo": "principal",
+      "largo_m": 105.0,
+      "ancho_m": 68.0,
+      "estado_verificacion": "referencia_inicial_no_verificada_en_esta_entrega",
+      "fuente": null,
+      "fecha_verificacion": null,
+      "notas": "Confirmar dimensiones con fuente oficial antes de usar como escala específica."
+    }
+  ]
+}

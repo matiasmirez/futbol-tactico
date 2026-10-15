@@ -1,28 +1,19 @@
-"""
-marcar_cancha.py
-
-Abre un frame del video, te deja clickear 4 puntos de la cancha
-y guarda calibracion_cancha.json listo para usar.
-
-Orden de clicks (importante):
-  1) Esquina superior-izquierda del area (o del rectangulo que elijas)
-  2) Esquina superior-derecha
-  3) Esquina inferior-derecha
-  4) Esquina inferior-izquierda
+"""Calibración manual de un rectángulo visible de cancha.
 
 Uso:
-    python marcar_cancha.py <ruta_video> [frame_numero]
+  python marcar_cancha.py VIDEO [FRAME] [ANCHO_M] [ALTO_M]
 
-Ejemplo:
-    python marcar_cancha.py "C:\\Users\\Matias\\Downloads\\chivas_penal.mp4" 105
+Seleccioná 4 esquinas del MISMO rectángulo, en orden:
+  superior-izquierda, superior-derecha, inferior-derecha, inferior-izquierda.
+
+El rectángulo puede ser el área grande (40.32 x 16.5), el área chica
+(18.32 x 5.5) u otro rectángulo cuyas dimensiones reales conozcas.
 """
-
 import sys
 import json
+from pathlib import Path
 import cv2
 import numpy as np
-from pathlib import Path
-
 
 BASE_DIR = Path(__file__).resolve().parent
 CALIBRATION_PATH = BASE_DIR / "calibracion_cancha.json"
@@ -30,181 +21,117 @@ CALIBRATION_PATH = BASE_DIR / "calibracion_cancha.json"
 
 def extraer_frame(video_path, frame_num):
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise ValueError(f"No se pudo abrir el video: {video_path}")
+    try:
+        if not cap.isOpened():
+            raise ValueError(f"No se pudo abrir el video: {video_path}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_num))
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise ValueError(f"No se pudo leer el frame {frame_num}")
+        return frame
+    finally:
+        cap.release()
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-    ret, frame = cap.read()
-    cap.release()
 
-    if not ret:
-        raise ValueError(f"No se pudo leer el frame {frame_num}")
-
-    return frame
+def validar_puntos(puntos, ancho_m, alto_m):
+    p = np.asarray(puntos, dtype=np.float32).reshape(4, 2)
+    if not np.isfinite(p).all():
+        raise ValueError("Los puntos contienen coordenadas inválidas.")
+    if abs(cv2.contourArea(p)) < 100:
+        raise ValueError("Los cuatro puntos forman un área demasiado pequeña.")
+    if not np.isfinite([ancho_m, alto_m]).all() or ancho_m <= 0 or alto_m <= 0:
+        raise ValueError("Ancho y alto deben ser números positivos.")
+    # Los puntos deben formar un cuadrilátero convexo, sin cruces.
+    if not cv2.isContourConvex(p.astype(np.int32)):
+        raise ValueError("Los puntos no forman un cuadrilátero convexo. Revisá el orden.")
+    return p.astype(int).tolist()
 
 
 def pedir_puntos(frame):
-    """
-    Abre una ventana y deja clickear 4 puntos.
-    Teclas:
-      u  -> deshacer ultimo punto
-      r  -> resetear
-      ENTER o ESPACIO -> confirmar (solo si hay 4)
-      ESC -> cancelar
-    """
     puntos = []
-    ventana = "marca 4 puntos - u=deshacer, r=reset, ENTER=ok, ESC=cancelar"
+    ventana = "Marcar 4 esquinas | u=deshacer r=reset ENTER=confirmar ESC=salir"
 
-    def redibujar():
+    def dibujar():
         img = frame.copy()
-
-        for i, (x, y) in enumerate(puntos):
-            cv2.circle(img, (x, y), 6, (0, 0, 255), -1)
-            cv2.putText(
-                img,
-                f"{i+1}",
-                (x + 8, y - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 0, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-        if len(puntos) >= 2:
-            for i in range(len(puntos) - 1):
-                cv2.line(img, puntos[i], puntos[i + 1], (0, 255, 0), 2)
-
+        for i, punto in enumerate(puntos):
+            cv2.circle(img, punto, 6, (0, 0, 255), -1)
+            cv2.putText(img, str(i + 1), (punto[0] + 8, punto[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        for i in range(1, len(puntos)):
+            cv2.line(img, puntos[i - 1], puntos[i], (0, 255, 0), 2)
         if len(puntos) == 4:
             cv2.line(img, puntos[3], puntos[0], (0, 255, 0), 2)
-
-        cv2.putText(
-            img,
-            f"Puntos: {len(puntos)}/4",
-            (15, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
+        cv2.putText(img, f"Puntos: {len(puntos)}/4", (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
         return img
 
-    def on_click(event, x, y, flags, param):
+    def click(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and len(puntos) < 4:
-            puntos.append((x, y))
+            puntos.append((int(x), int(y)))
 
     cv2.namedWindow(ventana, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(ventana, on_click)
-
-    while True:
-        cv2.imshow(ventana, redibujar())
-        key = cv2.waitKey(20) & 0xFF
-
-        if key == 27:  # ESC
-            cv2.destroyAllWindows()
-            return None
-
-        if key == ord("u") and puntos:
-            puntos.pop()
-
-        if key == ord("r"):
-            puntos.clear()
-
-        if key in (13, 32) and len(puntos) == 4:  # ENTER o ESPACIO
-            cv2.destroyAllWindows()
-            return puntos
-
-    return None
-
-
-def pedir_metros():
-    """
-    Pide las coordenadas reales en metros de esos 4 puntos.
-    Por defecto asume que marcaste las 4 esquinas de un rectangulo
-    y te pide ancho y alto.
-    """
-    print("\nAhora decime las medidas reales del rectangulo que marcaste.")
-    print("Ejemplo tipico: area grande = 16.5 m de fondo x 40.3 m de ancho")
-    print("Area chica = 5.5 m de fondo x 18.32 m de ancho")
-    print("(si marcaste otro rectangulo, pone las medidas que correspondan)\n")
-
-    ancho = input("Ancho real del rectangulo en metros [40.3]: ").strip()
-    alto = input("Alto real del rectangulo en metros [16.5]: ").strip()
-
+    cv2.setMouseCallback(ventana, click)
     try:
-        ancho = float(ancho) if ancho else 40.3
-    except ValueError:
-        ancho = 40.3
-
-    try:
-        alto = float(alto) if alto else 16.5
-    except ValueError:
-        alto = 16.5
-
-    return ancho, alto
+        while True:
+            cv2.imshow(ventana, dibujar())
+            key = cv2.waitKey(20) & 0xFF
+            if key == 27:
+                return None
+            if key == ord("u") and puntos:
+                puntos.pop()
+            elif key == ord("r"):
+                puntos.clear()
+            elif key in (10, 13, 32) and len(puntos) == 4:
+                return list(puntos)
+    finally:
+        cv2.destroyAllWindows()
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Uso: python marcar_cancha.py <ruta_video> [frame_numero]")
-        sys.exit(1)
-
-    video_path = Path(sys.argv[1])
+        print("Uso: python marcar_cancha.py VIDEO [FRAME] [ANCHO_M] [ALTO_M]")
+        raise SystemExit(2)
+    video = Path(sys.argv[1])
     frame_num = int(sys.argv[2]) if len(sys.argv) > 2 else 105
+    ancho_m = float(sys.argv[3]) if len(sys.argv) > 3 else 40.32
+    alto_m = float(sys.argv[4]) if len(sys.argv) > 4 else 16.5
+    if not video.exists():
+        raise SystemExit(f"No existe el video: {video}")
+    if ancho_m <= 0 or alto_m <= 0:
+        raise SystemExit("Las dimensiones deben ser positivas.")
 
-    if not video_path.exists():
-        print(f"No existe el video: {video_path}")
-        sys.exit(1)
-
-    print(f"Extrayendo frame {frame_num} de {video_path.name}...")
-    frame = extraer_frame(video_path, frame_num)
-
-    print("\nMarça 4 puntos en este orden:")
-    print("  1) esquina superior-izquierda")
-    print("  2) esquina superior-derecha")
-    print("  3) esquina inferior-derecha")
-    print("  4) esquina inferior-izquierda")
-    print("\nTeclas: u=deshacer, r=reset, ENTER=confirmar, ESC=cancelar\n")
-
+    frame = extraer_frame(video, frame_num)
+    print("Marcá las esquinas del mismo rectángulo, en orden TL, TR, BR, BL.")
+    print(f"Dimensiones declaradas: ancho={ancho_m:.3f} m, alto={alto_m:.3f} m")
+    print("No uses dimensiones del área grande si los puntos son de otra marca.")
     puntos = pedir_puntos(frame)
+    if puntos is None:
+        print("Cancelado; no se modificó la calibración.")
+        return
+    try:
+        puntos = validar_puntos(puntos, ancho_m, alto_m)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
-    if not puntos or len(puntos) != 4:
-        print("Cancelado.")
-        sys.exit(0)
-
-    ancho_m, alto_m = pedir_metros()
-
-    # Orden: TL, TR, BR, BL
-    field_vertices_m = [
-        [0.0, 0.0],
-        [ancho_m, 0.0],
-        [ancho_m, alto_m],
-        [0.0, alto_m],
-    ]
-
+    destino = [[0.0, 0.0], [ancho_m, 0.0],
+               [ancho_m, alto_m], [0.0, alto_m]]
     data = {
-        "instrucciones": (
-            "Configuración generada por marcar_cancha.py. "
-            "Los pixel_vertices y field_vertices_m están en el mismo orden. "
-            "Válida solo para frames donde la cámara no se haya movido mucho."
-        ),
-        "pixel_vertices": [[int(x), int(y)] for x, y in puntos],
-        "field_vertices_m": field_vertices_m,
-        "frame_de_calibracion": frame_num,
-        "nota": (
-            "Una homografía estática deja de ser válida cuando la cámara "
-            "panea o hace zoom. Recalibrar por tramos si es necesario."
-        ),
+        "version": 2,
+        "tipo": "calibracion_estatica",
+        "video": video.name,
+        "fps_frame": frame_num,
+        "pixel_vertices": puntos,
+        "field_vertices_m": destino,
+        "ancho_m": ancho_m,
+        "alto_m": alto_m,
+        "orden_puntos": ["superior_izquierda", "superior_derecha",
+                         "inferior_derecha", "inferior_izquierda"],
+        "nota": "Válida solo mientras no cambie el encuadre/zoom. Verificar visualmente.",
     }
-
-    with open(CALIBRATION_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-    print(f"\nGuardado: {CALIBRATION_PATH}")
-    print("pixel_vertices:", data["pixel_vertices"])
-    print("field_vertices_m:", data["field_vertices_m"])
+    tmp = CALIBRATION_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(CALIBRATION_PATH)
+    print(f"Calibración guardada: {CALIBRATION_PATH}")
 
 
 if __name__ == "__main__":

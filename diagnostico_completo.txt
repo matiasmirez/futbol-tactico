@@ -1,0 +1,118 @@
+C:\Users\Matias\Desktop\futbol\foot\futbol_corregido.py:207: FutureWarning: The `ByteTrack` was deprecated since v0.28.0. It will be removed in v0.31.0.
+  self.tracker = sv.ByteTrack()
+============================================================
+ANÁLISIS TÁCTICO DE FÚTBOL
+============================================================
+Video: C:\Users\Matias\Downloads\chivas_penal.mp4
+Modelo: C:\Users\Matias\Desktop\futbol\foot\models\best.pt
+Clip: chivas_penal
+
+1/6 - Cargando video...
+Fotogramas: 750
+FPS: 30.00
+
+2/6 - Detectando y siguiendo objetos...
+Traceback (most recent call last):
+  File "C:\Users\Matias\Desktop\futbol\foot\futbol_corregido.py", line 2656, in <module>
+    main()
+  File "C:\Users\Matias\Desktop\futbol\foot\futbol_corregido.py", line 2495, in main
+    tracks = tracker.get_object_tracks(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\futbol_corregido.py", line 246, in get_object_tracks
+    detections = self.detect_frames(frames)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\futbol_corregido.py", line 215, in detect_frames
+    results = self.model.predict(
+              ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\engine\model.py", line 568, in predict
+    return self.predictor.predict_cli(source=source) if is_cli else self.predictor(source=source, stream=stream)
+                                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\engine\predictor.py", line 268, in __call__
+    return list(self.stream_inference(source, model, *args, **kwargs))  # merge list of Results into one
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\utils\_contextlib.py", line 40, in generator_context
+    response = gen.send(None)
+               ^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\engine\predictor.py", line 391, in stream_inference
+    preds = self.inference(im, *args, **kwargs)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\engine\predictor.py", line 223, in inference
+    return self.model(im, *args, augment=self.args.augment, embed=self.args.embed, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\nn\autobackend.py", line 342, in forward
+    y = self.backend.forward(im, **forward_kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\nn\backends\pytorch.py", line 96, in forward
+    return self.model(im, augment=augment, embed=embed, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\nn\tasks.py", line 162, in forward
+    return self.predict(x, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\nn\tasks.py", line 179, in predict
+    return self._predict_once(x, profile, embed)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\nn\tasks.py", line 201, in _predict_once
+    x = m(x)  # run
+        ^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\nn\modules\block.py", line 348, in forward
+    return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+                               ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\container.py", line 259, in forward
+    input = module(input)
+            ^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\nn\modules\block.py", line 482, in forward
+    return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+                        ^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\ultralytics\nn\modules\conv.py", line 98, in forward_fuse
+    return self.act(self.conv(x))
+                    ^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1783, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\module.py", line 1794, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\conv.py", line 565, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Matias\Desktop\futbol\foot\.venv\Lib\site-packages\torch\nn\modules\conv.py", line 560, in _conv_forward
+    return F.conv2d(
+           ^^^^^^^^^
+KeyboardInterrupt
+^C
