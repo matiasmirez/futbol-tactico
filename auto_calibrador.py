@@ -171,6 +171,65 @@ class AutoCalibrador:
             if best is None or score > best[0]:
                 best = (score, idx, area_id, points)
         if best is None:
+            # Alternativa automática: buscar una región rectangular a partir de
+            # líneas parciales. Solo se acepta cuando se pueden inferir cuatro
+            # intersecciones geométricas plausibles; nunca se usa una escala px/m
+            # arbitraria. La región se interpreta como área penal (40.32 x 16.5 m).
+            try:
+                from detector_lineas_cancha import detectar_segmentos_cancha, ajustar_recta, interseccion_rectas
+                for idx in range(0, len(frames), max(1, int(paso))):
+                    segs = detectar_segmentos_cancha(frames[idx])
+                    if len(segs) < 4:
+                        continue
+                    # Mantener los segmentos más largos para reducir ruido de
+                    # camisetas, carteles y espectadores. Agrupar por orientación.
+                    segs = segs[:min(24, len(segs))]
+                    horizontal = [x for x in segs if min(x["angle_deg"], 180-x["angle_deg"]) < 25]
+                    vertical = [x for x in segs if 65 < x["angle_deg"] < 115]
+                    if len(horizontal) < 2 or len(vertical) < 2:
+                        continue
+                    # Probar pares de rectas en cada familia y seleccionar el
+                    # cuadrilátero de mayor área con proporción plausible.
+                    rect_h = [ajustar_recta([x]) for x in horizontal]
+                    rect_v = [ajustar_recta([x]) for x in vertical]
+                    candidates = []
+                    for a in range(len(rect_h)):
+                        for b in range(a+1, len(rect_h)):
+                            for c in range(len(rect_v)):
+                                for d in range(c+1, len(rect_v)):
+                                    pts = [interseccion_rectas(rect_h[a], rect_v[c]),
+                                           interseccion_rectas(rect_h[a], rect_v[d]),
+                                           interseccion_rectas(rect_h[b], rect_v[d]),
+                                           interseccion_rectas(rect_h[b], rect_v[c])]
+                                    if any(q is None for q in pts):
+                                        continue
+                                    pxy = np.asarray(pts, np.float32)
+                                    h, w = frames[idx].shape[:2]
+                                    # Permitir intersecciones extrapoladas ligeramente fuera
+                                    # de imagen, pero rechazar geometrías disparatadas.
+                                    if np.any(pxy[:,0] < -0.15*w) or np.any(pxy[:,0] > 1.15*w) or np.any(pxy[:,1] < -0.15*h) or np.any(pxy[:,1] > 1.15*h):
+                                        continue
+                                    area = abs(float(cv2.contourArea(pxy)))
+                                    if area < MIN_POLYGON_AREA_PX:
+                                        continue
+                                    sides = [float(np.linalg.norm(pxy[(i+1)%4]-pxy[i])) for i in range(4)]
+                                    if min(sides) < 15:
+                                        continue
+                                    ratio = max((sides[0]+sides[2])/2, (sides[1]+sides[3])/2) / max(1.0, min((sides[0]+sides[2])/2, (sides[1]+sides[3])/2))
+                                    if not 1.1 <= ratio <= 8.5:
+                                        continue
+                                    candidates.append((area, pxy))
+                    if candidates:
+                        area, pxy = max(candidates, key=lambda z:z[0])
+                        # Homografía de área local; la validación posterior rechaza
+                        # puntos no convexos o demasiado degenerados.
+                        if self._area_es_coherente(pxy):
+                            best = (area, idx, 0, pxy)
+                            print(f"[AutoCalibrador] Fallback por líneas parciales en frame {idx}.")
+                            break
+            except Exception as exc:
+                print(f"[AutoCalibrador] Fallback geométrico por líneas falló: {exc}")
+        if best is None:
             # Modo híbrido seguro: no abrir una ventana que exija cuatro
             # esquinas que no aparecen en pantalla. Detectamos marcas parciales
             # para diagnóstico/seguimiento, pero no inventamos una homografía
