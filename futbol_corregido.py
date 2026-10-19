@@ -34,7 +34,13 @@ from sklearn.cluster import KMeans
 from ultralytics import YOLO
 import supervision as sv
 
-from defensee import detectar_alertas_defensivas, resumir_secuencias_ataque, distancia_jugador_en_intervalo, metricas_jugador_con_sin_pelota
+from defensee import (
+    detectar_alertas_defensivas,
+    resumir_secuencias_ataque,
+    distancia_jugador_en_intervalo,
+    metricas_jugador_con_sin_pelota,
+    distancia_autor_gol,
+)
 
 # ============================================================
 # CONFIGURACIÓN
@@ -1056,7 +1062,7 @@ def nearest_rival_pairs(field_players, max_draw_distance):
 # ============================================================
 # VIDEO TÁCTICO CON DISTANCIAS Y GOLEADOR
 # ============================================================
-def create_tactical_video(frames, tracks, team_ball_control, output_path, eventos_tacticos=None, view_transformer=None):
+def create_tactical_video(frames, tracks, team_ball_control, output_path, eventos_tacticos=None, view_transformer=None, autores_gol=None):
     if not frames:
         raise ValueError("No hay fotogramas para generar el video.")
     height, width = frames[0].shape[:2]
@@ -1076,6 +1082,12 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
     total = min(len(frames), len(tracks["players"]), len(tracks["ball"]), len(team_ball_control))
     events = eventos_tacticos or []
     defensive_alerts_presentes = bool(events)
+
+    # Índice rápido: frame de remate -> info del autor (metros de la jugada)
+    autores_por_frame = {}
+    for autor in (autores_gol or []):
+        autores_por_frame[int(autor["fin_frame"])] = autor
+        autores_por_frame[int(autor["inicio_frame"])] = autor
 
     # Historial de posesión por frame: quién tiene la pelota
     posesion_por_frame = {}
@@ -1121,15 +1133,34 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
             for track_id, player in players.items():
                 if player.get("role") == "referee":
                     continue
-                escala = calcular_escala_local_por_jugador(player)
-                if escala is None:
-                    continue
-                player_anterior = None
-                if frame_num > 0:
-                    player_anterior = tracks["players"][frame_num - 1].get(track_id)
-                if player_anterior is not None:
-                    dist_m = calcular_distancia_recorrida(player, player_anterior, escala)
-                    distancias_recorridas[track_id] += dist_m
+                
+                # 1. Intentar calcular la distancia con homografía de cancha (metros exactos)
+                distancia_metros = 0.0
+                usa_homografia = False
+                
+                if view_transformer is not None and getattr(view_transformer, "enabled", False):
+                    pos_actual = get_player_position(player)
+                    player_anterior = tracks["players"][frame_num - 1].get(track_id) if frame_num > 0 else None
+                    if player_anterior is not None:
+                        pos_anterior = get_player_position(player_anterior)
+                        if pos_actual is not None and pos_anterior is not None:
+                            # Transformamos ambos pies a metros
+                            pt_act = view_transformer.transform_point(pos_actual)
+                            pt_ant = view_transformer.transform_point(pos_anterior)
+                            if pt_act is not None and pt_ant is not None:
+                                distancia_metros = np.linalg.norm(pt_act - pt_ant)
+                                usa_homografia = True
+                
+                # 2. Si la homografía falló (por el zoom), usamos la altura del jugador
+                if not usa_homografia:
+                    escala = calcular_escala_local_por_jugador(player)
+                    player_anterior = tracks["players"][frame_num - 1].get(track_id) if frame_num > 0 else None
+                    if player_anterior is not None and escala is not None:
+                        distancia_metros = calcular_distancia_recorrida(player, player_anterior, escala)
+                
+                # Sumar solo si la distancia es coherente (evita saltos por cambio de ID)
+                if 0 < distancia_metros <= 1.5: # 1.5 metros por frame es correr rapidísimo, más que eso es un salto
+                    distancias_recorridas[track_id] += distancia_metros
 
             ball = balls.get(1, {})
             ball_pos = get_ball_position(ball)
@@ -1335,11 +1366,23 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
                 if vel_m:
                     lineas.append(f"Velocidad del pase: {vel_m}" + (f" ({vel_kmh})" if vel_kmh else ""))
 
-                # Si es tiro al arco, mostrar la distancia del tirador
+                # Si es tiro al arco, mostrar la distancia del tirador y del autor del gol
                 if tipo == "tiro_al_arco" and active_event.get("tirador_id") is not None:
                     tirador_id = active_event["tirador_id"]
                     dist_tirador = distancias_recorridas.get(tirador_id, 0.0)
                     lineas.append(f"Distancia del tirador J{tirador_id}: {dist_tirador:.1f} m")
+                    info_autor = autores_por_frame.get(int(active_event.get("inicio_frame", -1)))
+                    if info_autor is not None and info_autor.get("metros_autor") is not None:
+                        lineas.append(
+                            f"Recorrido del autor J{info_autor['tirador_id']}: "
+                            f"{info_autor['metros_autor']:.1f} m en la jugada"
+                        )
+                        pases = info_autor.get("pases_previos", 0)
+                        jugadores = info_autor.get("jugadores_previos", [])
+                        if pases or jugadores:
+                            lineas.append(
+                                f"Secuencia: {pases} pase(s) previo(s); jugadores {jugadores}"
+                            )
 
                 ey = min(max(200, height - 90), height - 70)
                 alto_caja = 30 + 22 * (1 + len(lineas))
@@ -1513,6 +1556,27 @@ def main():
         print("\nNota: el intervalo es de ~15 s previos al remate. Los pases y la posesión son estimaciones automáticas.")
         print("El código muestra ID de seguimiento, no nombre real: para eso hace falta leer el dorsal o asociar la plantilla.")
 
+    # === NUEVO: metros del autor del gol (general para cualquier variante) ===
+    autores_gol = distancia_autor_gol(
+        tracks=tracks,
+        events=defensive_alerts,
+        fps=fps,
+        view_transformer=view_transformer,
+    )
+    print("\n=== DISTANCIA RECORRIDA POR EL AUTOR DEL GOL ===")
+    if not autores_gol:
+        print("No se pudo asociar un autor de remate a una secuencia.")
+    else:
+        for autor in autores_gol:
+            m, s = int(autor["inicio_seconds"] // 60), int(autor["inicio_seconds"] % 60)
+            print("-" * 58)
+            print(f"[{m:02d}:{s:02d}] Autor J{autor['tirador_id']} (equipo {autor['equipo']})")
+            print(f"  Ventana de jugada: frames {autor['inicio_frame']}–{autor['fin_frame']}")
+            print(f"  Distancia recorrida por el autor: {autor['metros_autor']} m")
+            print(f"  Método: {autor['metodo']}")
+            print(f"  Pases previos en la secuencia: {autor['pases_previos']}")
+            print(f"  Jugadores involucrados antes del remate: {autor['jugadores_previos']}")
+
     report = build_tactical_report(tracks, possession, fps=fps)
     report.to_csv(REPORT_PATH, index=False)
     create_summary(report).to_csv(SUMMARY_PATH, index=False)
@@ -1520,7 +1584,9 @@ def main():
 
     create_tactical_video(
         frames=frames, tracks=tracks, team_ball_control=possession,
-        output_path=TACTICAL_VIDEO_PATH, eventos_tacticos=defensive_alerts, view_transformer=view_transformer,
+        output_path=TACTICAL_VIDEO_PATH, eventos_tacticos=defensive_alerts,
+        view_transformer=view_transformer,
+        autores_gol=autores_gol,
     )
 
     print("\n6/6 - Resultados")
