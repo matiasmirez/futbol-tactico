@@ -15,7 +15,6 @@ TEAM_ARGENTINA = 1
 TEAM_ENGLAND = 2
 TEAM_NEUTRAL = 0
 ALTURA_JUGADOR_M = 1.75
-MAX_SPEED_M_S = 12.0  # Tope de velocidad humana (~43 km/h)
 
 
 def _valid_point(value):
@@ -44,6 +43,7 @@ def _bbox(player):
 
 
 def _player_point(player):
+    # Preferimos el punto de contacto con el suelo para jugadores.
     b = _bbox(player)
     if b is not None:
         return np.array([(b[0] + b[2]) / 2.0, b[3]], dtype=float)
@@ -78,6 +78,7 @@ def _transform(transformer, point, frame_num):
 
 
 def _metric_point(player, raw_point, transformer, frame_num):
+    # Solo se reportan metros reales si el punto cae dentro de una calibración válida.
     transformed = _transform(transformer, raw_point, frame_num)
     if transformed is not None:
         return transformed, "m"
@@ -87,6 +88,7 @@ def _metric_point(player, raw_point, transformer, frame_num):
     height = float(box[3] - box[1])
     if height <= 1:
         return None, "px"
+    # Fallback aproximado por altura aparente; perspectiva puede distorsionar mucho.
     return np.asarray(raw_point, dtype=float) * (ALTURA_JUGADOR_M / height), "estimado_m"
 
 
@@ -113,72 +115,16 @@ def _owner(players, ball_point, max_factor=1.65):
     return (tid, player) if ratio <= max_factor else None
 
 
-def _unificar_trayectorias_y_equipos(tracks, id_original, frame_remate, ventana_previa_s, fps):
-    """
-    Costura de identidad (Identity Stitching) con escala dinámica.
-    """
-    players_by_frame = tracks.get("players", [])
-    equipo_original = None
-    pos_remate = None
-    altura_px_remate = 50.0
-    
-    if frame_remate < len(players_by_frame):
-        p_remate = players_by_frame[frame_remate].get(id_original)
-        if p_remate:
-            equipo_original = p_remate.get("team")
-            pos_remate = _player_point(p_remate)
-            b = _bbox(p_remate)
-            if b is not None:
-                altura_px_remate = max(1.0, float(b[3] - b[1]))
-            
-    if equipo_original is None or pos_remate is None:
-        return [id_original]
-
-    ids_conocidos = [id_original]
-    limite = max(0, frame_remate - int(ventana_previa_s * fps))
-    m_por_px = ALTURA_JUGADOR_M / altura_px_remate
-    
-    for f in range(frame_remate - 1, limite - 1, -1):
-        frame_players = players_by_frame[f]
-        candidato_id = None
-        min_dist_metros = float('inf')
-        
-        for tid, p in frame_players.items():
-            if tid in ids_conocidos: 
-                continue
-            if p.get("team") != equipo_original:
-                continue
-                
-            pt = _player_point(p)
-            if pt is None: 
-                continue
-            
-            dist_px = _distance(pt, pos_remate)
-            dist_metros = dist_px * m_por_px
-            
-            frames_gap = frame_remate - f
-            max_metros_permitidos = frames_gap * 0.5 # 0.5m por frame
-            
-            if dist_metros <= max_metros_permitidos and dist_metros < min_dist_metros:
-                min_dist_metros = dist_metros
-                candidato_id = tid
-                
-        if candidato_id is not None:
-            ids_conocidos.append(candidato_id)
-            pos_remate = _player_point(players_by_frame[f][candidato_id])
-            b_cand = _bbox(players_by_frame[f][candidato_id])
-            if b_cand is not None:
-                altura_px_remate = max(1.0, float(b_cand[3] - b_cand[1]))
-                m_por_px = ALTURA_JUGADOR_M / altura_px_remate
-            
-    return ids_conocidos
-
-
 def detectar_alertas_defensivas(
     tracks, fps=25.0, salida_csv=None, tiempos_goles=None,
     equipo_en_posesion=None, view_transformer=None, bbox_arco=None,
     **kwargs,
 ):
+    """Devuelve eventos temporales compatibles con el panel del video.
+
+    `tiempos_goles` y `salida_csv` se aceptan por compatibilidad, pero no se usan:
+    la reconstrucción es automática y no depende de un CSV ni de marcas manuales.
+    """
     if not np.isfinite(fps) or fps <= 0:
         fps = 25.0
     players_by_frame = tracks.get("players", [])
@@ -197,6 +143,7 @@ def detectar_alertas_defensivas(
         owner_info = _owner(players, ball_px)
         owner_id, owner = owner_info if owner_info else (None, None)
         team = owner.get("team", TEAM_NEUTRAL) if owner else TEAM_NEUTRAL
+        # Posición del balón en metros cuando la calibración está disponible.
         ball_metric = _transform(view_transformer, ball_px, i)
         rows.append({
             "frame": i, "time": i / fps, "ball_px": ball_px,
@@ -241,6 +188,7 @@ def detectar_alertas_defensivas(
     for i, row in enumerate(rows):
         owner_id, owner, team = row["owner_id"], row["owner"], row["team"]
         ball_px = row["ball_px"]
+        # Desplazamiento del balón entre observaciones; limita saltos por oclusiones.
         ball_speed_px_s = None
         ball_distance_px = None
         if ball_px is not None and last_ball is not None and last_ball_frame is not None:
@@ -274,6 +222,7 @@ def detectar_alertas_defensivas(
                          jugador_id=carry_owner, equipo=carry_team,
                          metros_conduccion=round(carry_distance, 2),
                          metros_conduccion_equipo=round(team_carry_total.get(carry_team, 0.0), 2))
+                # Cambio de poseedor del mismo equipo: posible pase/recepción.
                 if last_owner is not None and owner_id != last_owner and last_team == team:
                     pass_count += 1
                     dist_m = None
@@ -295,6 +244,7 @@ def detectar_alertas_defensivas(
                 if player_point is not None and carry_last_point is not None and carry_last_frame is not None:
                     frame_gap = i - carry_last_frame
                     if 0 < frame_gap <= max(1, int(0.4 * fps)):
+                        # En píxeles la métrica solo se escala si no existe homografía; la etiqueta aclara aproximación.
                         transformed_now = _transform(view_transformer, player_point, i)
                         transformed_prev = _transform(view_transformer, carry_last_point, carry_last_frame)
                         if transformed_now is not None and transformed_prev is not None:
@@ -303,14 +253,13 @@ def detectar_alertas_defensivas(
                             box = _bbox(owner)
                             h = float(box[3] - box[1]) if box is not None else 0.0
                             step = _distance(player_point, carry_last_point) * (ALTURA_JUGADOR_M / h) if h > 1 else 0.0
-                        
-                        # Tope de velocidad física para evitar saltos por zoom/ID switch
-                        max_step = (frame_gap / fps) * MAX_SPEED_M_S
-                        if np.isfinite(step) and 0 <= step <= max_step:
+                        # Evitar sumar saltos imposibles por ID tracking inestable.
+                        if np.isfinite(step) and 0 <= step <= 4.0:
                             carry_distance += step
                             team_carry_total[team] += step
                     carry_last_point, carry_last_frame = player_point.copy(), i
 
+            # Candidato de remate: pelota muy rápida y poseedor cercano al balón.
             if ball_speed_px_s is not None and ball_speed_px_s > 650 and owner is not None:
                 if i - last_event_frame > int(0.8 * fps):
                     speed_kmh = None
@@ -329,6 +278,7 @@ def detectar_alertas_defensivas(
                     last_event_frame = i
         else:
             lost_frames += 1
+            # Ball moving quickly while owner is unknown can be a shot, pass, clearance or occlusion.
             if ball_speed_px_s is not None and ball_speed_px_s > 800 and i - last_event_frame > int(0.8 * fps):
                 team_guess = last_team if last_team in (TEAM_ARGENTINA, TEAM_ENGLAND) else TEAM_NEUTRAL
                 speed_kmh = None
@@ -353,6 +303,7 @@ def detectar_alertas_defensivas(
 
         last_owner, last_team = owner_id, team if team in (TEAM_ARGENTINA, TEAM_ENGLAND) else last_team
 
+    # Cerrar conducción y ataque al final del clip.
     if carry_owner is not None and carry_distance > 0.5:
         emit("conduccion", carry_start if carry_start is not None else total - 1,
              carry_last_frame if carry_last_frame is not None else total - 1,
@@ -365,6 +316,8 @@ def detectar_alertas_defensivas(
              equipo=attack_team, jugadores=list(dict.fromkeys(attack_players)),
              cantidad_pases=pass_count, metros_conduccion_equipo=round(team_carry_total[attack_team], 2))
 
+    # Marcar gol solo como probable cuando el balón desaparece tras una trayectoria rápida cerca del borde
+    # de imagen. No se afirma gol confirmado sin geometría de arco / línea de gol.
     for j, row in enumerate(rows):
         if row["ball_px"] is None:
             continue
@@ -375,8 +328,15 @@ def detectar_alertas_defensivas(
         prev = rows[max(0, j - 3)]["ball_px"]
         if prev is None:
             continue
+        p = row["ball_px"]
+        # Desaparición cerca de borde de imagen: solo candidato a revisar, muy propenso a oclusión.
+        # Se deja deliberadamente conservador y no se etiqueta como gol confirmado.
+        # No se crea evento si no hay señal de movimiento hacia el borde.
+        # Los datos del video no contienen necesariamente la línea del arco.
+        # Por ello se omite inferir un gol a partir de una mera desaparición.
         pass
 
+    # Orden temporal y eliminación de duplicados exactos.
     events.sort(key=lambda e: (e.get("inicio_seconds", 0), e.get("tipo_evento", "")))
     unique, seen = [], set()
     for event in events:
@@ -389,6 +349,7 @@ def detectar_alertas_defensivas(
 
 
 def resumir_secuencias_ataque(events):
+    """Produce resúmenes legibles para la consola; no escribe archivos."""
     summaries = []
     for event in events or []:
         if event.get("tipo_evento") != "fin_ataque":
@@ -407,6 +368,11 @@ def resumir_secuencias_ataque(events):
 
 
 def distancia_jugador_en_intervalo(tracks, jugador_id, inicio_frame, fin_frame, fps=25.0, view_transformer=None):
+    """Estima la distancia recorrida por un track en un intervalo de fotogramas.
+
+    Devuelve (metros, metodo). Si no hay calibración de cancha, la distancia
+    se aproxima usando la altura aparente del jugador y no debe tratarse como exacta.
+    """
     players_by_frame = tracks.get("players", [])
     if not players_by_frame:
         return None, "sin datos"
@@ -447,8 +413,7 @@ def distancia_jugador_en_intervalo(tracks, jugador_id, inicio_frame, fin_frame, 
             gap = frame_num - previous_frame
             if 0 < gap <= max(1, int(0.4 * fps)):
                 step = _distance(metric_point, previous_point)
-                max_step = (gap / fps) * MAX_SPEED_M_S
-                if np.isfinite(step) and 0 <= step <= max_step:
+                if np.isfinite(step) and 0 <= step <= 4.0:
                     total_distance += step
                     if method == "calibrado":
                         calibrated_steps += 1
@@ -469,6 +434,12 @@ def distancia_jugador_en_intervalo(tracks, jugador_id, inicio_frame, fin_frame, 
 
 
 def metricas_jugador_con_sin_pelota(tracks, jugador_id, inicio_frame, fin_frame, fps=25.0, view_transformer=None):
+    """Estima distancia total, con pelota y sin pelota para un track en un intervalo.
+
+    La posesión se aproxima por cercanía jugador-balón. Sin calibración válida,
+    la distancia usa una escala basada en la altura aparente y queda marcada como estimada.
+    Devuelve dict con metros y etiqueta de método.
+    """
     players_by_frame = tracks.get("players", [])
     balls_by_frame = tracks.get("ball", [])
     if not players_by_frame or not balls_by_frame:
@@ -509,9 +480,9 @@ def metricas_jugador_con_sin_pelota(tracks, jugador_id, inicio_frame, fin_frame,
             gap = frame_num - prev_frame
             if 0 < gap <= max(1, int(0.4 * fps)):
                 step = _distance(metric, prev_point)
-                max_step = (gap / fps) * MAX_SPEED_M_S
-                if np.isfinite(step) and 0 <= step <= max_step:
+                if np.isfinite(step) and 0 <= step <= 4.0:
                     total_m += step
+                    # Clasifica el tramo como con pelota si la posesión se estima en alguno de sus extremos.
                     if has_ball or prev_has_ball:
                         with_ball += step
                     else:
@@ -534,123 +505,94 @@ def metricas_jugador_con_sin_pelota(tracks, jugador_id, inicio_frame, fin_frame,
             "sin_pelota_m": round(without_ball, 2), "metodo": label}
 
 
-def _poseedor_en_frame(players, ball_point, max_factor=1.65):
-    if ball_point is None:
-        return None
-    choices = []
-    for tid, player in players.items():
-        if player.get("role", "field_player") not in ("field_player", "goalkeeper"):
-            continue
-        team = player.get("team", TEAM_NEUTRAL)
-        if team not in (TEAM_ARGENTINA, TEAM_ENGLAND):
-            continue
-        point = _player_point(player)
-        box = _bbox(player)
-        if point is None or box is None:
-            continue
-        d = _distance(point, ball_point)
-        h = max(1.0, float(box[3] - box[1]))
-        choices.append((d / h, d, tid))
-    if not choices:
-        return None
-    ratio, _, tid = min(choices, key=lambda x: x[0])
-    return tid if ratio <= max_factor else None
+def distancia_autor_gol(
+    tracks, events, fps=25.0, view_transformer=None, ventana_previa_segundos=15.0
+):
+    """Estima la distancia recorrida por el jugador asociado a un posible remate.
 
+    El tracking disponible no permite confirmar por sí solo que un remate haya
+    terminado en gol. Por compatibilidad con el informe existente, el nombre
+    histórico de la función se conserva, pero devuelve candidatos a autor de
+    remate (no goles confirmados).
 
-def _primer_frame_posesion_del_autor(tracks, autor_id, frame_remate, fps, ventana_previa_s):
-    ids_del_autor = _unificar_trayectorias_y_equipos(tracks, autor_id, frame_remate, ventana_previa_s, fps)
-    
+    Cada resultado contiene la distancia del jugador en la ventana previa al
+    evento, el método de medición, pases inferidos y jugadores involucrados.
+    """
+    if not np.isfinite(fps) or fps <= 0:
+        fps = 25.0
+
     players_by_frame = tracks.get("players", [])
-    balls_by_frame = tracks.get("ball", [])
-    total = min(len(players_by_frame), len(balls_by_frame))
-    if total == 0:
-        return max(0, frame_remate)
-
-    limite = max(0, frame_remate - int(ventana_previa_s * fps))
-    primer_frame_posesion = None
-    
-    for f in range(frame_remate, limite - 1, -1):
-        players = players_by_frame[f] or {}
-        ball = (balls_by_frame[f] or {}).get(1, {})
-        ball_px = _ball_point(ball)
-        if ball_px is None:
-            continue
-            
-        poseedor_id = _poseedor_en_frame(players, ball_px)
-        
-        if poseedor_id in ids_del_autor:
-            primer_frame_posesion = f
-            
-    if primer_frame_posesion is not None:
-        return primer_frame_posesion
-        
-    return limite
-
-
-def distancia_autor_gol(tracks, events, fps=25.0, view_transformer=None, ventana_previa_s=60.0):
-    players_by_frame = tracks.get("players", [])
-    if not players_by_frame or not events:
+    if not players_by_frame:
         return []
+
     total_frames = len(players_by_frame)
-    ordenados = sorted(events, key=lambda e: float(e.get("inicio_seconds", 0)))
+    shot_events = [
+        event for event in (events or [])
+        if event.get("tipo_evento") == "tiro_al_arco"
+        and event.get("tirador_id") not in (None, "")
+    ]
+    pass_events = [
+        event for event in (events or [])
+        if event.get("tipo_evento") == "pase_completado_posible"
+    ]
 
-    resultados = []
-    for evento in ordenados:
-        if evento.get("tipo_evento") != "tiro_al_arco":
-            continue
-        tirador = evento.get("tirador_id")
-        if tirador in (None, ""):
-            continue
-        fin_frame = min(total_frames - 1, int(evento.get("fin_frame", evento.get("inicio_frame", 0))))
-        frame_remate = int(evento.get("inicio_frame", fin_frame))
-        team = evento.get("equipo", TEAM_NEUTRAL)
+    results = []
+    seen = set()
+    window_frames = max(1, int(max(0.0, float(ventana_previa_segundos)) * fps))
 
-        inicio_frame = _primer_frame_posesion_del_autor(
-            tracks, tirador, frame_remate, fps, ventana_previa_s
+    for shot in sorted(shot_events, key=lambda e: int(e.get("inicio_frame", 0))):
+        try:
+            shooter_id = int(shot.get("tirador_id"))
+            shot_frame = max(0, min(total_frames - 1, int(shot.get("inicio_frame", 0))))
+            team = shot.get("equipo", TEAM_NEUTRAL)
+        except (TypeError, ValueError):
+            continue
+
+        # Evita repetir el mismo tirador cuando el detector genera varios
+        # candidatos de remate muy cercanos en el tiempo.
+        dedup_key = (shooter_id, shot_frame // max(1, int(2 * fps)))
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        start_frame = max(0, shot_frame - window_frames)
+        end_frame = max(start_frame, min(total_frames - 1, int(shot.get("fin_frame", shot_frame))))
+
+        distance, method = distancia_jugador_en_intervalo(
+            tracks, shooter_id, start_frame, end_frame,
+            fps=fps, view_transformer=view_transformer
         )
-        
-        ids_del_autor = _unificar_trayectorias_y_equipos(tracks, tirador, frame_remate, ventana_previa_s, fps)
-        
-        metros_totales = 0.0
-        metodos = []
-        
-        for un_id in ids_del_autor:
-            m, met = distancia_jugador_en_intervalo(
-                tracks, un_id, inicio_frame, fin_frame, fps=fps, view_transformer=view_transformer
-            )
-            if m is not None:
-                metros_totales += m
-                metodos.append(met)
 
-        metodo_final = metodos[0] if metodos else "sin datos"
-
-        ventana_inicio = max(0, frame_remate - int(ventana_previa_s * fps))
-        pases_previos = [
-            e for e in ordenados
-            if e is not evento
-            and e.get("tipo_evento") == "pase_completado_posible"
-            and e.get("equipo", TEAM_NEUTRAL) in (team, TEAM_NEUTRAL)
-            and ventana_inicio <= int(e.get("inicio_frame", 0)) <= frame_remate
+        start_seconds = start_frame / fps
+        end_seconds = end_frame / fps
+        prior_passes = [
+            event for event in pass_events
+            if start_seconds <= float(event.get("inicio_seconds", -1)) <= end_seconds
+            and event.get("equipo", team) == team
         ]
-        jugadores_previos = sorted({
-            j for e in ordenados
-            if e is not evento
-            and e.get("equipo", TEAM_NEUTRAL) in (team, TEAM_NEUTRAL)
-            and ventana_inicio <= int(e.get("inicio_frame", 0)) <= frame_remate
-            for j in (e.get("jugador_id"), e.get("pasador_id"), e.get("receptor_id"))
-            if j not in (None, "")
+
+        involved = []
+        for event in prior_passes:
+            for key in ("pasador_id", "receptor_id"):
+                player_id = event.get(key)
+                if player_id not in (None, "") and player_id not in involved:
+                    involved.append(player_id)
+
+        if shooter_id not in involved:
+            involved.append(shooter_id)
+
+        results.append({
+            "tipo_evento": "posible_remate",
+            "tirador_id": shooter_id,
+            "equipo": team,
+            "inicio_seconds": round(start_frame / fps, 3),
+            "fin_seconds": round(end_frame / fps, 3),
+            "inicio_frame": start_frame,
+            "fin_frame": end_frame,
+            "metros_autor": distance,
+            "metodo": method,
+            "pases_previos": len(prior_passes),
+            "jugadores_previos": involved,
         })
 
-        resultados.append({
-            "tirador_id": tirador,
-            "inicio_frame": inicio_frame,
-            "fin_frame": fin_frame,
-            "inicio_seconds": round(inicio_frame / fps, 3),
-            "fin_seconds": round(fin_frame / fps, 3),
-            "metros_autor": round(metros_totales, 2),
-            "metodo": metodo_final,
-            "pases_previos": len(pases_previos),
-            "jugadores_previos": jugadores_previos,
-            "equipo": team,
-        })
-    return resultados
+    return results

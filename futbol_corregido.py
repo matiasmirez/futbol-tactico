@@ -78,8 +78,9 @@ CALIBRATION_PATH = BASE_DIR / "calibracion_cancha.json"
 GOAL_TIMES_SECONDS = []
 
 MAP_SAMPLE_EVERY = 5
-DETECTION_CONFIDENCE = 0.10
-DETECTION_BATCH_SIZE = 20
+DETECTION_CONFIDENCE = 0.12
+DETECTION_BATCH_SIZE = 8
+DETECTION_IMAGE_SIZE = 1280
 
 TEAM_ARGENTINA = 1
 TEAM_ENGLAND = 2
@@ -246,24 +247,49 @@ class Tracker:
     muy similar y un intervalo de ausencia corto. No intenta adivinar si la
     apariencia no ofrece evidencia suficiente.
     """
-    REID_MAX_GAP_FRAMES = 75
-    REID_MIN_CORRELATION = 0.88
+    REID_MAX_GAP_FRAMES = 240
+    # Umbral combinado: el histograma de camiseta aislado es demasiado estricto
+    # y falla cuando cambia la iluminación, el jugador gira o queda parcialmente
+    # oculto. La asociación ahora combina apariencia, posición predicha y tamaño.
+    REID_MIN_CORRELATION = 0.48
+    REID_MAX_NORMALIZED_DISTANCE = 5.0
 
     def __init__(self, model_path):
         self.model = YOLO(str(model_path))
-        self.tracker = sv.ByteTrack()
+        self.tracker = self._create_tracker()
         self._raw_to_stable = {}
         self._appearance = {}
         self._last_seen = {}
         self._last_role = {}
         self._last_bbox = {}
+        self._last_center = {}
+        self._last_velocity = {}
         self._next_stable_id = 1
+
+    @staticmethod
+    def _create_tracker():
+        """Crea ByteTrack con buffer de oclusión, compatible con versiones de supervision."""
+        try:
+            return sv.ByteTrack(
+                track_activation_threshold=0.12,
+                lost_track_buffer=90,
+                minimum_matching_threshold=0.85,
+                frame_rate=30,
+            )
+        except TypeError:
+            # Compatibilidad con versiones antiguas de supervision.
+            return sv.ByteTrack()
 
     def detect_frames(self, frames):
         detections = []
         for start in range(0, len(frames), DETECTION_BATCH_SIZE):
             batch = frames[start:start + DETECTION_BATCH_SIZE]
-            results = self.model.predict(batch, conf=DETECTION_CONFIDENCE, verbose=False)
+            results = self.model.predict(
+                batch,
+                conf=DETECTION_CONFIDENCE,
+                imgsz=DETECTION_IMAGE_SIZE,
+                verbose=False,
+            )
             detections.extend(results)
         return detections
 
@@ -299,16 +325,29 @@ class Tracker:
             return -1.0
 
     def _stable_id_for(self, raw_id, role, descriptor, bbox, frame_num, used_stable_ids):
+        """Asocia IDs crudos a identidades estables con apariencia + movimiento.
+
+        La posición se normaliza por la altura del jugador para tolerar cambios
+        de escala por perspectiva. Se evita reutilizar una identidad dos veces
+        en el mismo fotograma y se restringen las asociaciones imposibles.
+        """
+        raw_id = int(raw_id)
         if raw_id in self._raw_to_stable:
             stable_id = self._raw_to_stable[raw_id]
-            # Si el ID crudo fue reutilizado mientras el ID estable ya está
-            # ocupado en este frame, se trata como una identidad nueva.
-            if stable_id not in used_stable_ids:
+            last_seen = self._last_seen.get(stable_id, -10**9)
+            # Mantener el mapeo del tracker si sigue vivo y no está ya asignado.
+            if (stable_id not in used_stable_ids
+                    and frame_num - last_seen <= self.REID_MAX_GAP_FRAMES):
                 return stable_id
+            # Si el ID crudo reaparece tras un intervalo excesivo o colisiona,
+            # se busca una identidad compatible en vez de forzar el mapeo viejo.
             self._raw_to_stable.pop(raw_id, None)
 
-        best_id, best_score = None, self.REID_MIN_CORRELATION
-        current_height = max(1.0, float(bbox[3]) - float(bbox[1]))
+        x1, y1, x2, y2 = map(float, bbox[:4])
+        center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=float)
+        current_height = max(1.0, y2 - y1)
+        best_id, best_score = None, -1.0
+
         for candidate_id, old_hist in self._appearance.items():
             if candidate_id in used_stable_ids:
                 continue
@@ -317,20 +356,47 @@ class Tracker:
             gap = frame_num - self._last_seen.get(candidate_id, -10**9)
             if gap < 1 or gap > self.REID_MAX_GAP_FRAMES:
                 continue
+
             old_bbox = self._last_bbox.get(candidate_id)
-            if bbox_is_valid(old_bbox):
-                old_height = max(1.0, float(old_bbox[3]) - float(old_bbox[1]))
-                ratio = current_height / old_height
-                # Evita asociar jugadores muy distintos en tamaño por perspectiva.
-                if ratio < 0.58 or ratio > 1.72:
-                    continue
-            score = self._appearance_similarity(descriptor, old_hist)
-            if score > best_score:
+            old_height = max(1.0, float(old_bbox[3]) - float(old_bbox[1])) if bbox_is_valid(old_bbox) else current_height
+            size_ratio = current_height / old_height
+            if size_ratio < 0.52 or size_ratio > 1.90:
+                continue
+
+            appearance = self._appearance_similarity(descriptor, old_hist)
+            if appearance < 0.0:
+                continue
+
+            old_center = self._last_center.get(candidate_id)
+            old_velocity = self._last_velocity.get(candidate_id, np.zeros(2, dtype=float))
+            if old_center is None:
+                normalized_distance = 2.0
+            else:
+                # Limitar la extrapolación para que un movimiento brusco no
+                # proyecte al jugador a través de toda la imagen.
+                predicted = np.asarray(old_center, dtype=float) + np.clip(
+                    np.asarray(old_velocity, dtype=float), -current_height * 0.75,
+                    current_height * 0.75
+                ) * min(gap, 4)
+                normalized_distance = float(np.linalg.norm(center - predicted) / max(current_height, old_height))
+
+            if normalized_distance > self.REID_MAX_NORMALIZED_DISTANCE:
+                continue
+
+            # La apariencia pesa más, pero la cercanía temporal/espacial ayuda
+            # a distinguir compañeros con camisetas del mismo color.
+            spatial_score = float(np.exp(-normalized_distance / 1.8))
+            gap_score = float(np.exp(-gap / 55.0))
+            size_score = float(np.exp(-abs(np.log(max(size_ratio, 1e-6))) / 0.7))
+            score = 0.62 * max(0.0, appearance) + 0.23 * spatial_score + 0.10 * gap_score + 0.05 * size_score
+            threshold = self.REID_MIN_CORRELATION + min(0.12, gap / 1000.0)
+            if score >= threshold and score > best_score:
                 best_id, best_score = candidate_id, score
 
         if best_id is None:
             best_id = self._next_stable_id
             self._next_stable_id += 1
+
         self._raw_to_stable[raw_id] = best_id
         return best_id
 
@@ -346,6 +412,19 @@ class Tracker:
             except Exception as exc:
                 print(f"[Tracker] No se pudo leer el stub: {exc}")
 
+        # Cada vídeo comienza con un espacio de IDs independiente. Evita que
+        # identidades guardadas de una ejecución previa contaminen este análisis.
+        self._raw_to_stable.clear()
+        self._appearance.clear()
+        self._last_seen.clear()
+        self._last_role.clear()
+        self._last_bbox.clear()
+        self._last_center.clear()
+        self._last_velocity.clear()
+        self._next_stable_id = 1
+        self.tracker = self._create_tracker()
+
+        print(f"[Tracker] Detección: imgsz={DETECTION_IMAGE_SIZE}, conf={DETECTION_CONFIDENCE}, batch={DETECTION_BATCH_SIZE}; re-ID hasta {self.REID_MAX_GAP_FRAMES} frames.")
         detections = self.detect_frames(frames)
         tracks = {"players": [], "referees": [], "ball": []}
         for frame_num, detection in enumerate(detections):
@@ -381,7 +460,8 @@ class Tracker:
                 )
                 used_stable_ids.add(stable_id)
                 info = {"bbox": bbox, "role": role, "class_name": class_name,
-                        "raw_track_id": raw_id}
+                        "raw_track_id": raw_id,
+                        "position": tuple(get_foot_position(bbox))}
                 tracks["players"][frame_num][stable_id] = info
                 if role == "referee":
                     tracks["referees"][frame_num][stable_id] = info.copy()
@@ -395,6 +475,19 @@ class Tracker:
                                                      descriptor.astype(np.float32), 0.35, 0)
                         cv2.normalize(descriptor, descriptor, alpha=1.0, norm_type=cv2.NORM_L1)
                     self._appearance[stable_id] = descriptor
+                current_center = np.asarray(get_center_of_bbox(bbox), dtype=float)
+                previous_center = self._last_center.get(stable_id)
+                previous_frame = self._last_seen.get(stable_id)
+                if previous_center is not None and previous_frame is not None:
+                    elapsed = max(1, frame_num - previous_frame)
+                    velocity = (current_center - np.asarray(previous_center, dtype=float)) / elapsed
+                    # Suavizar velocidad para que una detección ruidosa no
+                    # desvíe demasiado la predicción de reidentificación.
+                    old_velocity = np.asarray(self._last_velocity.get(stable_id, np.zeros(2)), dtype=float)
+                    self._last_velocity[stable_id] = 0.65 * old_velocity + 0.35 * velocity
+                else:
+                    self._last_velocity[stable_id] = np.zeros(2, dtype=float)
+                self._last_center[stable_id] = current_center
                 self._last_seen[stable_id] = frame_num
                 self._last_role[stable_id] = role
                 self._last_bbox[stable_id] = bbox
