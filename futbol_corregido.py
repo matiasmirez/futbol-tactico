@@ -34,13 +34,7 @@ from sklearn.cluster import KMeans
 from ultralytics import YOLO
 import supervision as sv
 
-from defensee import (
-    detectar_alertas_defensivas,
-    resumir_secuencias_ataque,
-    distancia_jugador_en_intervalo,
-    metricas_jugador_con_sin_pelota,
-    distancia_autor_gol,
-)
+from defensee import detectar_alertas_defensivas, resumir_secuencias_ataque, distancia_jugador_en_intervalo, metricas_jugador_con_sin_pelota
 
 # ============================================================
 # CONFIGURACIÓN
@@ -78,9 +72,8 @@ CALIBRATION_PATH = BASE_DIR / "calibracion_cancha.json"
 GOAL_TIMES_SECONDS = []
 
 MAP_SAMPLE_EVERY = 5
-DETECTION_CONFIDENCE = 0.12
-DETECTION_BATCH_SIZE = max(1, int(os.environ.get("FUTBOL_BATCH", "4")))
-DETECTION_IMAGE_SIZE = int(os.environ.get("FUTBOL_IMGSZ", "960"))
+DETECTION_CONFIDENCE = 0.10
+DETECTION_BATCH_SIZE = 20
 
 TEAM_ARGENTINA = 1
 TEAM_ENGLAND = 2
@@ -165,36 +158,6 @@ def safe_fps(video_path):
         return 25.0
     return float(fps)
 
-def _stub_metadata(video_path=VIDEO_PATH, model_path=MODEL_PATH, kind=""):
-    """Firma de caché para no reutilizar tracks de otro video/modelo."""
-    def _stat(path):
-        try:
-            st = Path(path).stat()
-            return {"path": str(Path(path).resolve()), "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
-        except OSError:
-            return {"path": str(path), "missing": True}
-    data = {
-        "kind": str(kind),
-        "video": _stat(video_path),
-        "model": _stat(model_path) if model_path is not None else None,
-    }
-    if kind == "tracks":
-        data["detection"] = {"conf": DETECTION_CONFIDENCE, "imgsz": DETECTION_IMAGE_SIZE, "batch": DETECTION_BATCH_SIZE}
-    return data
-
-def _valid_stub_metadata(stub_path, expected):
-    meta_path = Path(str(stub_path) + ".meta.json")
-    try:
-        with meta_path.open("r", encoding="utf-8") as fh:
-            return json.load(fh) == expected
-    except (OSError, ValueError, json.JSONDecodeError):
-        return False
-
-def _save_stub_metadata(stub_path, metadata):
-    meta_path = Path(str(stub_path) + ".meta.json")
-    with meta_path.open("w", encoding="utf-8") as fh:
-        json.dump(metadata, fh, ensure_ascii=False, indent=2)
-
 # ============================================================
 # CALIBRACIÓN POR REFERENCIA HUMANA Y ARCO
 # ============================================================
@@ -270,127 +233,174 @@ def read_video(video_path):
 # TRACKER
 # ============================================================
 class Tracker:
-    """Detector YOLO + ByteTrack, sin reidentificación por apariencia (ReID)."""
+    """YOLO + ByteTrack con una capa de reidentificación persistente.
+
+    ByteTrack conserva identidades durante oclusiones cortas. Esta capa intenta
+    recuperar una identidad estable si el tracker devuelve un ID nuevo, usando
+    rol, histograma HSV de camiseta, tamaño y posición/velocidad estimadas.
+    No puede garantizar identidad perfecta cuando jugadores idénticos se cruzan.
+    """
+    # Recupera jugadores tras oclusiones moderadas sin enlazar toda la cancha a ciegas.
+    REID_MAX_GAP_FRAMES = 75
+    REID_MIN_CORRELATION = 0.60
+    MAX_SPEED_PX_PER_FRAME = 24.0
 
     def __init__(self, model_path):
         self.model = YOLO(str(model_path))
-        self.tracker = self._create_tracker()
-
-    @staticmethod
-    def _create_tracker():
-        """Crea ByteTrack con buffer de oclusión y compatibilidad entre versiones."""
+        # Parámetros compatibles con versiones habituales de supervision.
         try:
-            return sv.ByteTrack(
-                track_activation_threshold=0.12,
-                lost_track_buffer=90,
-                minimum_matching_threshold=0.85,
-                frame_rate=30,
-            )
+            self.tracker = sv.ByteTrack(track_activation_threshold=0.15,
+                                        lost_track_buffer=75,
+                                        minimum_matching_threshold=0.75,
+                                        frame_rate=30)
         except TypeError:
-            return sv.ByteTrack()
+            self.tracker = sv.ByteTrack()
+        self._raw_to_stable = {}
+        self._appearance = {}
+        self._last_seen = {}
+        self._last_role = {}
+        self._last_bbox = {}
+        self._last_position = {}
+        self._velocity = {}
+        self._next_stable_id = 1
 
     def detect_frames(self, frames):
-        """Detecta por lotes, muestra progreso y reduce el lote si falta memoria."""
-        import time
-
         detections = []
-        total = len(frames)
-        batch_size = max(1, DETECTION_BATCH_SIZE)
-        started = time.perf_counter()
-        print(
-            f"[Tracker] Iniciando YOLO: {total} frames, lote={batch_size}, "
-            f"imgsz={DETECTION_IMAGE_SIZE}. Sin ReID.", flush=True,
-        )
-
-        start = 0
-        while start < total:
-            current_batch_size = min(batch_size, total - start)
-            batch = frames[start:start + current_batch_size]
-            try:
-                results = self.model.predict(
-                    source=batch,
-                    conf=DETECTION_CONFIDENCE,
-                    imgsz=DETECTION_IMAGE_SIZE,
-                    batch=current_batch_size,
-                    verbose=False,
-                )
-            except RuntimeError as exc:
-                message = str(exc).lower()
-                is_memory_error = (
-                    "out of memory" in message
-                    or "cuda error: out of memory" in message
-                    or "can't allocate memory" in message
-                )
-                if not is_memory_error or current_batch_size <= 1:
-                    print(
-                        f"\n[Tracker] Error procesando frames {start + 1}-"
-                        f"{start + current_batch_size}: {exc}", flush=True
-                    )
-                    raise
-                batch_size = max(1, current_batch_size // 2)
-                print(
-                    f"\n[Tracker] Memoria insuficiente; reduzco lote a {batch_size} "
-                    f"y reintento desde el frame {start + 1}.", flush=True
-                )
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                continue
-
+        for start in range(0, len(frames), DETECTION_BATCH_SIZE):
+            batch = frames[start:start + DETECTION_BATCH_SIZE]
+            results = self.model.predict(batch, conf=DETECTION_CONFIDENCE, verbose=False)
             detections.extend(results)
-            start += current_batch_size
-            done = len(detections)
-            elapsed = time.perf_counter() - started
-            fps_inference = done / max(elapsed, 1e-6)
-            remaining = (total - done) / max(fps_inference, 1e-6)
-            print(
-                f"[Tracker] YOLO: {done}/{total} frames "
-                f"({100.0 * done / total:.1f}%) | "
-                f"{fps_inference:.1f} frames/s | ETA aprox. {remaining / 60:.1f} min",
-                flush=True,
-            )
         return detections
 
+    @staticmethod
+    def _appearance_descriptor(frame, bbox):
+        if frame is None or not bbox_is_valid(bbox):
+            return None
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = map(int, bbox[:4])
+        x1, x2 = max(0, x1), min(w, x2)
+        y1, y2 = max(0, y1), min(h, y2)
+        if x2 - x1 < 8 or y2 - y1 < 12:
+            return None
+        # Camiseta/torso, recortando parcialmente fondo y piernas.
+        crop = frame[y1 + int((y2-y1)*0.12):y1 + int((y2-y1)*0.68),
+                     x1 + int((x2-x1)*0.15):x1 + int((x2-x1)*0.85)]
+        if crop.size == 0:
+            return None
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [18, 8], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
+        return hist
+
+    @staticmethod
+    def _appearance_similarity(first, second):
+        if first is None or second is None:
+            return -1.0
+        try:
+            score = cv2.compareHist(first.astype(np.float32), second.astype(np.float32),
+                                    cv2.HISTCMP_CORREL)
+            return float(score) if np.isfinite(score) else -1.0
+        except cv2.error:
+            return -1.0
+
+    @staticmethod
+    def _foot_center(bbox):
+        return np.array([(float(bbox[0]) + float(bbox[2])) / 2.0,
+                         float(bbox[3])], dtype=float)
+
+    def _candidate_score(self, stable_id, role, descriptor, bbox, frame_num):
+        if self._last_role.get(stable_id) != role:
+            return None
+        gap = frame_num - self._last_seen.get(stable_id, -10**9)
+        if gap < 1 or gap > self.REID_MAX_GAP_FRAMES:
+            return None
+        old_bbox = self._last_bbox.get(stable_id)
+        if bbox_is_valid(old_bbox):
+            old_h = max(1.0, float(old_bbox[3]) - float(old_bbox[1]))
+            new_h = max(1.0, float(bbox[3]) - float(bbox[1]))
+            ratio = new_h / old_h
+            if ratio < 0.48 or ratio > 2.10:
+                return None
+        similarity = self._appearance_similarity(descriptor, self._appearance.get(stable_id))
+        # La apariencia por sí sola no basta: se compara con una posición
+        # extrapolada según la velocidad reciente, con tolerancia al hueco.
+        current_pos = self._foot_center(bbox)
+        last_pos = self._last_position.get(stable_id)
+        velocity = self._velocity.get(stable_id, np.zeros(2, dtype=float))
+        if last_pos is not None:
+            # Extrapolar solo unos fotogramas evita que una velocidad ruidosa
+            # proyecte al futbolista a una posición imposible durante una oclusión.
+            prediction_gap = min(gap, 6)
+            predicted = last_pos + velocity * prediction_gap
+            dist = float(np.linalg.norm(current_pos - predicted))
+            # La tolerancia crece con el tiempo perdido y contempla paneos/cambios
+            # de escala de la cámara, pero tiene un límite para evitar falsos enlaces.
+            max_dist = min(300.0, 55.0 + 15.0 * gap)
+            if dist > max_dist:
+                return None
+            spatial_score = max(0.0, 1.0 - dist / max_dist)
+        else:
+            spatial_score = 0.20
+        if similarity < self.REID_MIN_CORRELATION:
+            return None
+        # La apariencia identifica la camiseta; la trayectoria ayuda a separar
+        # jugadores del mismo equipo. Penaliza coincidencias visuales lejanas.
+        return 0.68 * similarity + 0.32 * spatial_score
+
+    def _stable_id_for(self, raw_id, role, descriptor, bbox, frame_num, used_stable_ids):
+        raw_id = int(raw_id)
+        mapped_id = self._raw_to_stable.get(raw_id)
+        if mapped_id is not None and mapped_id not in used_stable_ids:
+            gap = frame_num - self._last_seen.get(mapped_id, -10**9)
+            # ID ByteTrack consecutivo/reciente: mantener identidad si rol y tamaño coinciden.
+            if 0 <= gap <= 2 and self._last_role.get(mapped_id) == role:
+                old_bbox = self._last_bbox.get(mapped_id)
+                if not bbox_is_valid(old_bbox):
+                    return mapped_id
+                old_h = max(1.0, float(old_bbox[3]) - float(old_bbox[1]))
+                new_h = max(1.0, float(bbox[3]) - float(bbox[1]))
+                if 0.50 <= new_h / old_h <= 2.0:
+                    return mapped_id
+            # No devolver sin validar un ID crudo antiguo: puede estar obsoleto.
+            self._raw_to_stable.pop(raw_id, None)
+
+        best_id, best_score = None, -1.0
+        for candidate_id in list(self._last_seen.keys()):
+            if candidate_id in used_stable_ids:
+                continue
+            score = self._candidate_score(candidate_id, role, descriptor, bbox, frame_num)
+            if score is not None and score > best_score:
+                best_id, best_score = candidate_id, score
+        if best_id is None:
+            best_id = self._next_stable_id
+            self._next_stable_id += 1
+        self._raw_to_stable[raw_id] = best_id
+        return best_id
+
     def get_object_tracks(self, frames, read_from_stub=False, stub_path=None):
-        expected_meta = _stub_metadata(kind="tracks")
-        if read_from_stub and stub_path and os.path.exists(stub_path) and _valid_stub_metadata(stub_path, expected_meta):
+        if read_from_stub and stub_path and os.path.exists(stub_path):
             try:
                 with open(stub_path, "rb") as file:
                     cached = pickle.load(file)
                 if (len(cached.get("players", [])) == len(frames)
                         and len(cached.get("ball", [])) == len(frames)):
-                    print("[Tracker] Caché válida: reutilizando detecciones y tracking.")
+                    print("[Tracker] Stub válido.")
                     return cached
             except Exception as exc:
                 print(f"[Tracker] No se pudo leer el stub: {exc}")
 
-        self.tracker = self._create_tracker()
-        print(
-            f"[Tracker] Detección: imgsz={DETECTION_IMAGE_SIZE}, "
-            f"conf={DETECTION_CONFIDENCE}, batch={DETECTION_BATCH_SIZE}; ReID desactivado.",
-            flush=True,
-        )
         detections = self.detect_frames(frames)
         tracks = {"players": [], "referees": [], "ball": []}
-
         for frame_num, detection in enumerate(detections):
-            if (frame_num == 0) or ((frame_num + 1) % 50 == 0) or (frame_num + 1 == len(detections)):
-                print(
-                    f"[Tracker] ByteTrack: {frame_num + 1}/{len(detections)} frames "
-                    f"({100.0 * (frame_num + 1) / max(1, len(detections)):.1f}%)",
-                    flush=True,
-                )
-            names = {int(class_id): str(name).strip().lower()
-                     for class_id, name in detection.names.items()}
+            frame = frames[frame_num]
+            names = {int(cid): str(name).strip().lower()
+                     for cid, name in detection.names.items()}
             tracks["players"].append({})
             tracks["referees"].append({})
             tracks["ball"].append({})
             dets = sv.Detections.from_ultralytics(detection)
             tracked_dets = self.tracker.update_with_detections(dets)
-
+            used_stable_ids = set()
             for item in tracked_dets:
                 bbox = item[0].tolist()
                 class_id_value = item[3]
@@ -406,21 +416,48 @@ class Tracker:
                     role = "referee"
                 else:
                     continue
+                raw_id = int(raw_id_value)
+                descriptor = self._appearance_descriptor(frame, bbox)
+                stable_id = self._stable_id_for(raw_id, role, descriptor, bbox,
+                                                frame_num, used_stable_ids)
+                used_stable_ids.add(stable_id)
+                position = self._foot_center(bbox)
+                previous_pos = self._last_position.get(stable_id)
+                previous_frame = self._last_seen.get(stable_id)
+                if previous_pos is not None and previous_frame is not None:
+                    dt = max(1, frame_num - previous_frame)
+                    measured_velocity = (position - previous_pos) / dt
+                    # Limitar valores espurios producidos por oclusiones o cajas erróneas.
+                    speed = float(np.linalg.norm(measured_velocity))
+                    if speed <= self.MAX_SPEED_PX_PER_FRAME:
+                        old_v = self._velocity.get(stable_id, measured_velocity)
+                        self._velocity[stable_id] = 0.65 * old_v + 0.35 * measured_velocity
+                    else:
+                        self._velocity.setdefault(stable_id, np.zeros(2, dtype=float))
+                else:
+                    self._velocity.setdefault(stable_id, np.zeros(2, dtype=float))
 
-                # Se usa directamente el ID asignado por ByteTrack; no hay
-                # descriptores de apariencia, matching adicional ni ReID.
-                track_id = int(raw_id_value)
-                info = {
-                    "bbox": bbox,
-                    "role": role,
-                    "class_name": class_name,
-                    "raw_track_id": track_id,
-                    "position": tuple(get_foot_position(bbox)),
-                }
-                tracks["players"][frame_num][track_id] = info
+                info = {"bbox": bbox, "role": role, "class_name": class_name,
+                        "raw_track_id": raw_id}
+                tracks["players"][frame_num][stable_id] = info
                 if role == "referee":
-                    tracks["referees"][frame_num][track_id] = info.copy()
+                    tracks["referees"][frame_num][stable_id] = info.copy()
 
+                if descriptor is not None:
+                    previous_hist = self._appearance.get(stable_id)
+                    if previous_hist is not None:
+                        descriptor = cv2.addWeighted(previous_hist.astype(np.float32), 0.70,
+                                                     descriptor.astype(np.float32), 0.30, 0)
+                        cv2.normalize(descriptor, descriptor, alpha=1.0,
+                                      norm_type=cv2.NORM_L1)
+                    self._appearance[stable_id] = descriptor
+                self._last_seen[stable_id] = frame_num
+                self._last_role[stable_id] = role
+                self._last_bbox[stable_id] = bbox
+                self._last_position[stable_id] = position
+
+            # El balón no se pasa por ByteTrack porque suele perderse y cambiar de ID;
+            # guardar la detección de mayor confianza de cada frame.
             ball_candidates = []
             for item in dets:
                 bbox = item[0].tolist()
@@ -428,15 +465,14 @@ class Tracker:
                 confidence = item[2]
                 if class_id_value is None:
                     continue
-                class_name = names.get(int(class_id_value), "")
-                if class_name != "ball" or not bbox_is_valid(bbox):
+                if names.get(int(class_id_value), "") != "ball" or not bbox_is_valid(bbox):
                     continue
                 confidence = float(confidence) if confidence is not None else 0.0
                 ball_candidates.append((confidence, bbox))
             if ball_candidates:
                 confidence, bbox = max(ball_candidates, key=lambda value: value[0])
                 tracks["ball"][frame_num][1] = {
-                    "bbox": bbox, "class_name": "ball", "confidence": confidence,
+                    "bbox": bbox, "class_name": "ball", "confidence": confidence
                 }
 
         if stub_path:
@@ -444,8 +480,7 @@ class Tracker:
             if stub_dir:
                 os.makedirs(stub_dir, exist_ok=True)
             with open(stub_path, "wb") as file:
-                pickle.dump(tracks, file, protocol=pickle.HIGHEST_PROTOCOL)
-            _save_stub_metadata(stub_path, expected_meta)
+                pickle.dump(tracks, file)
         return tracks
 
     def add_position_to_tracks(self, tracks):
@@ -466,8 +501,7 @@ class Tracker:
         x_center, _ = get_center_of_bbox(bbox)
         y2 = int(bbox[3])
         width = max(8, int(get_bbox_width(bbox)))
-        cv2.ellipse(frame, (x_center, y2),
-                    (max(8, width // 2), max(4, int(width * 0.18))),
+        cv2.ellipse(frame, (x_center, y2), (max(8, width // 2), max(4, int(width * 0.18))),
                     0, 0, 360, color, 2)
         if track_id is not None:
             cv2.putText(frame, str(track_id), (x_center - 10, y2 + 23),
@@ -696,13 +730,11 @@ class CameraMovementEstimator:
         }
 
     def get_camera_movement(self, frames, read_from_stub=False, stub_path=None):
-        expected_meta = _stub_metadata(model_path=None, kind="camera")
-        if read_from_stub and stub_path and os.path.exists(stub_path) and _valid_stub_metadata(stub_path, expected_meta):
+        if read_from_stub and stub_path and os.path.exists(stub_path):
             try:
                 with open(stub_path, "rb") as file:
                     cached = pickle.load(file)
                 if len(cached) == len(frames):
-                    print("[Cámara] Caché válida: reutilizando movimiento estimado.")
                     return cached
             except Exception as exc:
                 print(f"[Cámara] No se pudo leer stub: {exc}")
@@ -731,8 +763,7 @@ class CameraMovementEstimator:
         if stub_path:
             os.makedirs(os.path.dirname(stub_path), exist_ok=True)
             with open(stub_path, "wb") as file:
-                pickle.dump(movements, file, protocol=pickle.HIGHEST_PROTOCOL)
-            _save_stub_metadata(stub_path, expected_meta)
+                pickle.dump(movements, file)
         return movements
 
     def add_adjust_positions_to_tracks(self, tracks, movements):
@@ -1195,7 +1226,7 @@ def nearest_rival_pairs(field_players, max_draw_distance):
 # ============================================================
 # VIDEO TÁCTICO CON DISTANCIAS Y GOLEADOR
 # ============================================================
-def create_tactical_video(frames, tracks, team_ball_control, output_path, eventos_tacticos=None, view_transformer=None, autores_gol=None):
+def create_tactical_video(frames, tracks, team_ball_control, output_path, eventos_tacticos=None, view_transformer=None):
     if not frames:
         raise ValueError("No hay fotogramas para generar el video.")
     height, width = frames[0].shape[:2]
@@ -1207,21 +1238,14 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
 
     previous_positions = {}
     previous_ball_world = None
-    previous_ball_world_frame = None
+    previous_ball_frame = None
     previous_ball_px = None
-    previous_ball_px_frame = None
     distancias_recorridas = defaultdict(float)  # track_id -> metros acumulados
     max_speed_ms = 55.0
     max_gap_seconds = 0.25
     total = min(len(frames), len(tracks["players"]), len(tracks["ball"]), len(team_ball_control))
     events = eventos_tacticos or []
     defensive_alerts_presentes = bool(events)
-
-    # Índice rápido: frame de remate -> info del autor (metros de la jugada)
-    autores_por_frame = {}
-    for autor in (autores_gol or []):
-        autores_por_frame[int(autor["fin_frame"])] = autor
-        autores_por_frame[int(autor["inicio_frame"])] = autor
 
     # Historial de posesión por frame: quién tiene la pelota
     posesion_por_frame = {}
@@ -1267,57 +1291,15 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
             for track_id, player in players.items():
                 if player.get("role") == "referee":
                     continue
-                
-                distancia_metros = 0.0
-                usa_homografia = False
-                player_anterior = tracks["players"][frame_num - 1].get(track_id) if frame_num > 0 else None
+                escala = calcular_escala_local_por_jugador(player)
+                if escala is None:
+                    continue
+                player_anterior = None
+                if frame_num > 0:
+                    player_anterior = tracks["players"][frame_num - 1].get(track_id)
                 if player_anterior is not None:
-                    # Primero usar las posiciones métricas ya calculadas por el
-                    # calibrador (puede ser una homografía por tramos).
-                    pt_act = player.get("position_transformed")
-                    pt_ant = player_anterior.get("position_transformed")
-                    if pt_act is not None and pt_ant is not None:
-                        pt_act = np.asarray(pt_act, dtype=float).reshape(-1)[:2]
-                        pt_ant = np.asarray(pt_ant, dtype=float).reshape(-1)[:2]
-                        if np.isfinite(pt_act).all() and np.isfinite(pt_ant).all():
-                            distancia_metros = float(np.linalg.norm(pt_act - pt_ant))
-                            usa_homografia = True
-
-                    # Compatibilidad con calibradores que no guardan posiciones
-                    # transformadas dentro de cada track.
-                    if not usa_homografia and view_transformer is not None and getattr(view_transformer, "enabled", False):
-                        pos_actual = get_player_position(player)
-                        pos_anterior = get_player_position(player_anterior)
-                        if pos_actual is not None and pos_anterior is not None:
-                            try:
-                                pt_act = view_transformer.transform_point(pos_actual)
-                                pt_ant = view_transformer.transform_point(pos_anterior)
-                                if pt_act is not None and pt_ant is not None:
-                                    distancia_metros = float(np.linalg.norm(np.asarray(pt_act)[:2] - np.asarray(pt_ant)[:2]))
-                                    usa_homografia = np.isfinite(distancia_metros)
-                            except (TypeError, ValueError, AttributeError):
-                                usa_homografia = False
-
-                    # Sin homografía fiable: compensar paneo y estimar escala con
-                    # la altura de ambos frames, en lugar de medir píxeles crudos.
-                    if not usa_homografia:
-                        escala_actual = calcular_escala_local_por_jugador(player)
-                        escala_anterior = calcular_escala_local_por_jugador(player_anterior)
-                        escalas = [v for v in (escala_actual, escala_anterior) if v is not None and np.isfinite(v)]
-                        pos_actual = player.get("position_adjusted")
-                        pos_anterior = player_anterior.get("position_adjusted")
-                        if not (pos_actual is not None and pos_anterior is not None):
-                            pos_actual = get_player_position(player)
-                            pos_anterior = get_player_position(player_anterior)
-                        if escalas and pos_actual is not None and pos_anterior is not None:
-                            escala = float(np.mean(escalas))
-                            distancia_metros = float(np.linalg.norm(np.asarray(pos_actual, dtype=float)[:2] - np.asarray(pos_anterior, dtype=float)[:2]) * escala)
-
-                    # Límite físico por tiempo real: evita saltos de identidad o
-                    # detecciones erróneas sin descartar carreras rápidas a 25/30 FPS.
-                    max_por_frame = max_speed_ms / max(1.0, fps)
-                    if np.isfinite(distancia_metros) and 0 < distancia_metros <= max_por_frame:
-                        distancias_recorridas[track_id] += distancia_metros
+                    dist_m = calcular_distancia_recorrida(player, player_anterior, escala)
+                    distancias_recorridas[track_id] += dist_m
 
             ball = balls.get(1, {})
             ball_pos = get_ball_position(ball)
@@ -1357,20 +1339,14 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
             if (view_transformer is not None and getattr(view_transformer, "enabled", False)):
                 ball_world = None
                 try:
-                    try:
-                        # AutoCalibrador necesita el frame actual: usar siempre
-                        # la homografía correspondiente al instante del balón.
-                        ball_world = view_transformer.transform_point(ball_pos, frame_num=frame_num)
-                    except TypeError:
-                        # Compatibilidad con ViewTransformer y calibradores antiguos.
-                        ball_world = view_transformer.transform_point(ball_pos)
+                    ball_world = view_transformer.transform_point(ball_pos)
                 except Exception:
-                    ball_world = None
+                    pass
                 if ball_world is not None:
                     ball_world = np.asarray(ball_world, dtype=float).reshape(-1)[:2]
                     if (ball_world.size == 2 and np.isfinite(ball_world).all()):
-                        if (previous_ball_world is not None and previous_ball_world_frame is not None):
-                            frames_elapsed = frame_num - previous_ball_world_frame
+                        if (previous_ball_world is not None and previous_ball_frame is not None):
+                            frames_elapsed = frame_num - previous_ball_frame
                             dt = frames_elapsed / fps
                             if frames_elapsed > 0 and 0 < dt <= max_gap_seconds:
                                 distance_m = float(np.linalg.norm(ball_world - previous_ball_world))
@@ -1381,16 +1357,16 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
                                     metodo_velocidad = "homografía"
                                 else:
                                     previous_ball_world = None
-                                    previous_ball_world_frame = None
+                                    previous_ball_frame = None
                         if ball_world is not None:
                             previous_ball_world = ball_world.copy()
-                            previous_ball_world_frame = frame_num
+                            previous_ball_frame = frame_num
 
             if speed_ms is None and ball_pos is not None:
                 escala_balon = estimar_escala_balon_por_jugador_cercano(players, ball_pos)
                 if escala_balon is not None:
-                    if previous_ball_px is not None and previous_ball_px_frame is not None:
-                        frames_elapsed = frame_num - previous_ball_px_frame
+                    if previous_ball_px is not None and previous_ball_frame is not None:
+                        frames_elapsed = frame_num - previous_ball_frame
                         dt = frames_elapsed / fps
                         if frames_elapsed > 0 and 0 < dt <= max_gap_seconds:
                             dist_px = float(np.linalg.norm(np.asarray(ball_pos) - np.asarray(previous_ball_px)))
@@ -1401,10 +1377,10 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
                                 speed_kmh = candidate_speed * 3.6
                                 metodo_velocidad = "ref. jugador"
                     previous_ball_px = np.asarray(ball_pos, dtype=float).copy()
-                    previous_ball_px_frame = frame_num
+                    previous_ball_frame = frame_num
                 else:
                     previous_ball_px = None
-                    previous_ball_px_frame = None
+                    previous_ball_frame = None
 
             if speed_ms is not None:
                 speed_text = f"Velocidad balón ({metodo_velocidad}): {speed_ms:.1f} m/s ({speed_kmh:.1f} km/h)"
@@ -1447,7 +1423,7 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
                 (f"E2 formacion: {formation_2}", TEAM_COLORS[TEAM_ENGLAND]),
                 (f"E1 dispersion: {compact_1}", TEAM_COLORS[TEAM_ARGENTINA]),
                 (f"E2 dispersion: {compact_2}", TEAM_COLORS[TEAM_ENGLAND]),
-                ("Distancias: homografia si valida; si no, escala estimada", WHITE),
+                ("Distancias: estimadas por altura de jugador", WHITE),
                 ("MODO REVISION: eventos candidatos" if defensive_alerts_presentes else "MODO REVISION: sin eventos en este tramo", WHITE),
                 (speed_text, YELLOW),
             ]
@@ -1529,23 +1505,11 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
                 if vel_m:
                     lineas.append(f"Velocidad del pase: {vel_m}" + (f" ({vel_kmh})" if vel_kmh else ""))
 
-                # Si es tiro al arco, mostrar la distancia del tirador y del autor del gol
+                # Si es tiro al arco, mostrar la distancia del tirador
                 if tipo == "tiro_al_arco" and active_event.get("tirador_id") is not None:
                     tirador_id = active_event["tirador_id"]
                     dist_tirador = distancias_recorridas.get(tirador_id, 0.0)
                     lineas.append(f"Distancia del tirador J{tirador_id}: {dist_tirador:.1f} m")
-                    info_autor = autores_por_frame.get(int(active_event.get("inicio_frame", -1)))
-                    if info_autor is not None and info_autor.get("metros_autor") is not None:
-                        lineas.append(
-                            f"Recorrido del autor J{info_autor['tirador_id']}: "
-                            f"{info_autor['metros_autor']:.1f} m en la jugada"
-                        )
-                        pases = info_autor.get("pases_previos", 0)
-                        jugadores = info_autor.get("jugadores_previos", [])
-                        if pases or jugadores:
-                            lineas.append(
-                                f"Secuencia: {pases} pase(s) previo(s); jugadores {jugadores}"
-                            )
 
                 ey = min(max(200, height - 90), height - 70)
                 alto_caja = 30 + 22 * (1 + len(lineas))
@@ -1608,7 +1572,7 @@ def main():
 
     print("\n2/6 - Detectando y siguiendo objetos...")
     tracker = Tracker(MODEL_PATH)
-    tracks = tracker.get_object_tracks(frames, read_from_stub=True, stub_path=str(TRACKS_STUB))
+    tracks = tracker.get_object_tracks(frames, read_from_stub=False, stub_path=str(TRACKS_STUB))
     if len(tracks["players"]) != len(frames):
         raise RuntimeError(f"La cantidad de fotogramas no coincide con el tracking: {len(frames)} vs {len(tracks['players'])}")
     tracker.add_position_to_tracks(tracks)
@@ -1633,7 +1597,7 @@ def main():
 
     print("\n4/6 - Estabilizando coordenadas y cargando calibración...")
     camera_estimator = CameraMovementEstimator(frames[0])
-    camera_movements = camera_estimator.get_camera_movement(frames, read_from_stub=True, stub_path=str(CAMERA_STUB))
+    camera_movements = camera_estimator.get_camera_movement(frames, read_from_stub=False, stub_path=str(CAMERA_STUB))
     print(f"Desplazamientos de cámara: {len(camera_movements)}")
     camera_estimator.add_adjust_positions_to_tracks(tracks, camera_movements)
 
@@ -1719,27 +1683,6 @@ def main():
         print("\nNota: el intervalo es de ~15 s previos al remate. Los pases y la posesión son estimaciones automáticas.")
         print("El código muestra ID de seguimiento, no nombre real: para eso hace falta leer el dorsal o asociar la plantilla.")
 
-    # === NUEVO: metros del autor del gol (general para cualquier variante) ===
-    autores_gol = distancia_autor_gol(
-        tracks=tracks,
-        events=defensive_alerts,
-        fps=fps,
-        view_transformer=view_transformer,
-    )
-    print("\n=== DISTANCIA RECORRIDA POR EL AUTOR DEL GOL ===")
-    if not autores_gol:
-        print("No se pudo asociar un autor de remate a una secuencia.")
-    else:
-        for autor in autores_gol:
-            m, s = int(autor["inicio_seconds"] // 60), int(autor["inicio_seconds"] % 60)
-            print("-" * 58)
-            print(f"[{m:02d}:{s:02d}] Autor J{autor['tirador_id']} (equipo {autor['equipo']})")
-            print(f"  Ventana de jugada: frames {autor['inicio_frame']}–{autor['fin_frame']}")
-            print(f"  Distancia recorrida por el autor: {autor['metros_autor']} m")
-            print(f"  Método: {autor['metodo']}")
-            print(f"  Pases previos en la secuencia: {autor['pases_previos']}")
-            print(f"  Jugadores involucrados antes del remate: {autor['jugadores_previos']}")
-
     report = build_tactical_report(tracks, possession, fps=fps)
     report.to_csv(REPORT_PATH, index=False)
     create_summary(report).to_csv(SUMMARY_PATH, index=False)
@@ -1747,9 +1690,7 @@ def main():
 
     create_tactical_video(
         frames=frames, tracks=tracks, team_ball_control=possession,
-        output_path=TACTICAL_VIDEO_PATH, eventos_tacticos=defensive_alerts,
-        view_transformer=view_transformer,
-        autores_gol=autores_gol,
+        output_path=TACTICAL_VIDEO_PATH, eventos_tacticos=defensive_alerts, view_transformer=view_transformer,
     )
 
     print("\n6/6 - Resultados")
