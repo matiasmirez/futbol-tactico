@@ -79,8 +79,8 @@ GOAL_TIMES_SECONDS = []
 
 MAP_SAMPLE_EVERY = 5
 DETECTION_CONFIDENCE = 0.12
-DETECTION_BATCH_SIZE = 8
-DETECTION_IMAGE_SIZE = 1280
+DETECTION_BATCH_SIZE = max(1, int(os.environ.get("FUTBOL_BATCH", "4")))
+DETECTION_IMAGE_SIZE = int(os.environ.get("FUTBOL_IMGSZ", "960"))
 
 TEAM_ARGENTINA = 1
 TEAM_ENGLAND = 2
@@ -165,6 +165,36 @@ def safe_fps(video_path):
         return 25.0
     return float(fps)
 
+def _stub_metadata(video_path=VIDEO_PATH, model_path=MODEL_PATH, kind=""):
+    """Firma de caché para no reutilizar tracks de otro video/modelo."""
+    def _stat(path):
+        try:
+            st = Path(path).stat()
+            return {"path": str(Path(path).resolve()), "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+        except OSError:
+            return {"path": str(path), "missing": True}
+    data = {
+        "kind": str(kind),
+        "video": _stat(video_path),
+        "model": _stat(model_path) if model_path is not None else None,
+    }
+    if kind == "tracks":
+        data["detection"] = {"conf": DETECTION_CONFIDENCE, "imgsz": DETECTION_IMAGE_SIZE, "batch": DETECTION_BATCH_SIZE}
+    return data
+
+def _valid_stub_metadata(stub_path, expected):
+    meta_path = Path(str(stub_path) + ".meta.json")
+    try:
+        with meta_path.open("r", encoding="utf-8") as fh:
+            return json.load(fh) == expected
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+def _save_stub_metadata(stub_path, metadata):
+    meta_path = Path(str(stub_path) + ".meta.json")
+    with meta_path.open("w", encoding="utf-8") as fh:
+        json.dump(metadata, fh, ensure_ascii=False, indent=2)
+
 # ============================================================
 # CALIBRACIÓN POR REFERENCIA HUMANA Y ARCO
 # ============================================================
@@ -240,35 +270,15 @@ def read_video(video_path):
 # TRACKER
 # ============================================================
 class Tracker:
-    """Detector + ByteTrack con recuperación conservadora de IDs por apariencia.
-
-    ByteTrack puede asignar un ID nuevo después de una oclusión. Este wrapper
-    mantiene un ID estable cuando reaparece un jugador con apariencia visual
-    muy similar y un intervalo de ausencia corto. No intenta adivinar si la
-    apariencia no ofrece evidencia suficiente.
-    """
-    REID_MAX_GAP_FRAMES = 240
-    # Umbral combinado: el histograma de camiseta aislado es demasiado estricto
-    # y falla cuando cambia la iluminación, el jugador gira o queda parcialmente
-    # oculto. La asociación ahora combina apariencia, posición predicha y tamaño.
-    REID_MIN_CORRELATION = 0.48
-    REID_MAX_NORMALIZED_DISTANCE = 5.0
+    """Detector YOLO + ByteTrack, sin reidentificación por apariencia (ReID)."""
 
     def __init__(self, model_path):
         self.model = YOLO(str(model_path))
         self.tracker = self._create_tracker()
-        self._raw_to_stable = {}
-        self._appearance = {}
-        self._last_seen = {}
-        self._last_role = {}
-        self._last_bbox = {}
-        self._last_center = {}
-        self._last_velocity = {}
-        self._next_stable_id = 1
 
     @staticmethod
     def _create_tracker():
-        """Crea ByteTrack con buffer de oclusión, compatible con versiones de supervision."""
+        """Crea ByteTrack con buffer de oclusión y compatibilidad entre versiones."""
         try:
             return sv.ByteTrack(
                 track_activation_threshold=0.12,
@@ -277,165 +287,109 @@ class Tracker:
                 frame_rate=30,
             )
         except TypeError:
-            # Compatibilidad con versiones antiguas de supervision.
             return sv.ByteTrack()
 
     def detect_frames(self, frames):
+        """Detecta por lotes, muestra progreso y reduce el lote si falta memoria."""
+        import time
+
         detections = []
-        for start in range(0, len(frames), DETECTION_BATCH_SIZE):
-            batch = frames[start:start + DETECTION_BATCH_SIZE]
-            results = self.model.predict(
-                batch,
-                conf=DETECTION_CONFIDENCE,
-                imgsz=DETECTION_IMAGE_SIZE,
-                verbose=False,
-            )
+        total = len(frames)
+        batch_size = max(1, DETECTION_BATCH_SIZE)
+        started = time.perf_counter()
+        print(
+            f"[Tracker] Iniciando YOLO: {total} frames, lote={batch_size}, "
+            f"imgsz={DETECTION_IMAGE_SIZE}. Sin ReID.", flush=True,
+        )
+
+        start = 0
+        while start < total:
+            current_batch_size = min(batch_size, total - start)
+            batch = frames[start:start + current_batch_size]
+            try:
+                results = self.model.predict(
+                    source=batch,
+                    conf=DETECTION_CONFIDENCE,
+                    imgsz=DETECTION_IMAGE_SIZE,
+                    batch=current_batch_size,
+                    verbose=False,
+                )
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                is_memory_error = (
+                    "out of memory" in message
+                    or "cuda error: out of memory" in message
+                    or "can't allocate memory" in message
+                )
+                if not is_memory_error or current_batch_size <= 1:
+                    print(
+                        f"\n[Tracker] Error procesando frames {start + 1}-"
+                        f"{start + current_batch_size}: {exc}", flush=True
+                    )
+                    raise
+                batch_size = max(1, current_batch_size // 2)
+                print(
+                    f"\n[Tracker] Memoria insuficiente; reduzco lote a {batch_size} "
+                    f"y reintento desde el frame {start + 1}.", flush=True
+                )
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                continue
+
             detections.extend(results)
+            start += current_batch_size
+            done = len(detections)
+            elapsed = time.perf_counter() - started
+            fps_inference = done / max(elapsed, 1e-6)
+            remaining = (total - done) / max(fps_inference, 1e-6)
+            print(
+                f"[Tracker] YOLO: {done}/{total} frames "
+                f"({100.0 * done / total:.1f}%) | "
+                f"{fps_inference:.1f} frames/s | ETA aprox. {remaining / 60:.1f} min",
+                flush=True,
+            )
         return detections
 
-    @staticmethod
-    def _appearance_descriptor(frame, bbox):
-        """Histograma HSV del torso/parte central; no requiere modelos extra."""
-        if frame is None or not bbox_is_valid(bbox):
-            return None
-        height, width = frame.shape[:2]
-        x1, y1, x2, y2 = map(int, bbox[:4])
-        x1, x2 = max(0, x1), min(width, x2)
-        y1, y2 = max(0, y1), min(height, y2)
-        if x2 - x1 < 8 or y2 - y1 < 12:
-            return None
-        # Se reduce el fondo y se prioriza la camiseta, útil para reidentificación.
-        crop = frame[y1 + int((y2-y1)*0.12):y1 + int((y2-y1)*0.78),
-                     x1 + int((x2-x1)*0.15):x1 + int((x2-x1)*0.85)]
-        if crop.size == 0:
-            return None
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
-        cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
-        return hist
-
-    @staticmethod
-    def _appearance_similarity(first, second):
-        if first is None or second is None:
-            return -1.0
-        try:
-            value = cv2.compareHist(first.astype(np.float32), second.astype(np.float32), cv2.HISTCMP_CORREL)
-            return float(value) if np.isfinite(value) else -1.0
-        except cv2.error:
-            return -1.0
-
-    def _stable_id_for(self, raw_id, role, descriptor, bbox, frame_num, used_stable_ids):
-        """Asocia IDs crudos a identidades estables con apariencia + movimiento.
-
-        La posición se normaliza por la altura del jugador para tolerar cambios
-        de escala por perspectiva. Se evita reutilizar una identidad dos veces
-        en el mismo fotograma y se restringen las asociaciones imposibles.
-        """
-        raw_id = int(raw_id)
-        if raw_id in self._raw_to_stable:
-            stable_id = self._raw_to_stable[raw_id]
-            last_seen = self._last_seen.get(stable_id, -10**9)
-            # Mantener el mapeo del tracker si sigue vivo y no está ya asignado.
-            if (stable_id not in used_stable_ids
-                    and frame_num - last_seen <= self.REID_MAX_GAP_FRAMES):
-                return stable_id
-            # Si el ID crudo reaparece tras un intervalo excesivo o colisiona,
-            # se busca una identidad compatible en vez de forzar el mapeo viejo.
-            self._raw_to_stable.pop(raw_id, None)
-
-        x1, y1, x2, y2 = map(float, bbox[:4])
-        center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=float)
-        current_height = max(1.0, y2 - y1)
-        best_id, best_score = None, -1.0
-
-        for candidate_id, old_hist in self._appearance.items():
-            if candidate_id in used_stable_ids:
-                continue
-            if self._last_role.get(candidate_id) != role:
-                continue
-            gap = frame_num - self._last_seen.get(candidate_id, -10**9)
-            if gap < 1 or gap > self.REID_MAX_GAP_FRAMES:
-                continue
-
-            old_bbox = self._last_bbox.get(candidate_id)
-            old_height = max(1.0, float(old_bbox[3]) - float(old_bbox[1])) if bbox_is_valid(old_bbox) else current_height
-            size_ratio = current_height / old_height
-            if size_ratio < 0.52 or size_ratio > 1.90:
-                continue
-
-            appearance = self._appearance_similarity(descriptor, old_hist)
-            if appearance < 0.0:
-                continue
-
-            old_center = self._last_center.get(candidate_id)
-            old_velocity = self._last_velocity.get(candidate_id, np.zeros(2, dtype=float))
-            if old_center is None:
-                normalized_distance = 2.0
-            else:
-                # Limitar la extrapolación para que un movimiento brusco no
-                # proyecte al jugador a través de toda la imagen.
-                predicted = np.asarray(old_center, dtype=float) + np.clip(
-                    np.asarray(old_velocity, dtype=float), -current_height * 0.75,
-                    current_height * 0.75
-                ) * min(gap, 4)
-                normalized_distance = float(np.linalg.norm(center - predicted) / max(current_height, old_height))
-
-            if normalized_distance > self.REID_MAX_NORMALIZED_DISTANCE:
-                continue
-
-            # La apariencia pesa más, pero la cercanía temporal/espacial ayuda
-            # a distinguir compañeros con camisetas del mismo color.
-            spatial_score = float(np.exp(-normalized_distance / 1.8))
-            gap_score = float(np.exp(-gap / 55.0))
-            size_score = float(np.exp(-abs(np.log(max(size_ratio, 1e-6))) / 0.7))
-            score = 0.62 * max(0.0, appearance) + 0.23 * spatial_score + 0.10 * gap_score + 0.05 * size_score
-            threshold = self.REID_MIN_CORRELATION + min(0.12, gap / 1000.0)
-            if score >= threshold and score > best_score:
-                best_id, best_score = candidate_id, score
-
-        if best_id is None:
-            best_id = self._next_stable_id
-            self._next_stable_id += 1
-
-        self._raw_to_stable[raw_id] = best_id
-        return best_id
-
     def get_object_tracks(self, frames, read_from_stub=False, stub_path=None):
-        if read_from_stub and stub_path and os.path.exists(stub_path):
+        expected_meta = _stub_metadata(kind="tracks")
+        if read_from_stub and stub_path and os.path.exists(stub_path) and _valid_stub_metadata(stub_path, expected_meta):
             try:
                 with open(stub_path, "rb") as file:
                     cached = pickle.load(file)
                 if (len(cached.get("players", [])) == len(frames)
                         and len(cached.get("ball", [])) == len(frames)):
-                    print("[Tracker] Stub válido.")
+                    print("[Tracker] Caché válida: reutilizando detecciones y tracking.")
                     return cached
             except Exception as exc:
                 print(f"[Tracker] No se pudo leer el stub: {exc}")
 
-        # Cada vídeo comienza con un espacio de IDs independiente. Evita que
-        # identidades guardadas de una ejecución previa contaminen este análisis.
-        self._raw_to_stable.clear()
-        self._appearance.clear()
-        self._last_seen.clear()
-        self._last_role.clear()
-        self._last_bbox.clear()
-        self._last_center.clear()
-        self._last_velocity.clear()
-        self._next_stable_id = 1
         self.tracker = self._create_tracker()
-
-        print(f"[Tracker] Detección: imgsz={DETECTION_IMAGE_SIZE}, conf={DETECTION_CONFIDENCE}, batch={DETECTION_BATCH_SIZE}; re-ID hasta {self.REID_MAX_GAP_FRAMES} frames.")
+        print(
+            f"[Tracker] Detección: imgsz={DETECTION_IMAGE_SIZE}, "
+            f"conf={DETECTION_CONFIDENCE}, batch={DETECTION_BATCH_SIZE}; ReID desactivado.",
+            flush=True,
+        )
         detections = self.detect_frames(frames)
         tracks = {"players": [], "referees": [], "ball": []}
+
         for frame_num, detection in enumerate(detections):
-            frame = frames[frame_num]
-            names = {int(class_id): str(name).strip().lower() for class_id, name in detection.names.items()}
+            if (frame_num == 0) or ((frame_num + 1) % 50 == 0) or (frame_num + 1 == len(detections)):
+                print(
+                    f"[Tracker] ByteTrack: {frame_num + 1}/{len(detections)} frames "
+                    f"({100.0 * (frame_num + 1) / max(1, len(detections)):.1f}%)",
+                    flush=True,
+                )
+            names = {int(class_id): str(name).strip().lower()
+                     for class_id, name in detection.names.items()}
             tracks["players"].append({})
             tracks["referees"].append({})
             tracks["ball"].append({})
             dets = sv.Detections.from_ultralytics(detection)
             tracked_dets = self.tracker.update_with_detections(dets)
-            used_stable_ids = set()
 
             for item in tracked_dets:
                 bbox = item[0].tolist()
@@ -453,44 +407,19 @@ class Tracker:
                 else:
                     continue
 
-                raw_id = int(raw_id_value)
-                descriptor = self._appearance_descriptor(frame, bbox)
-                stable_id = self._stable_id_for(
-                    raw_id, role, descriptor, bbox, frame_num, used_stable_ids
-                )
-                used_stable_ids.add(stable_id)
-                info = {"bbox": bbox, "role": role, "class_name": class_name,
-                        "raw_track_id": raw_id,
-                        "position": tuple(get_foot_position(bbox))}
-                tracks["players"][frame_num][stable_id] = info
+                # Se usa directamente el ID asignado por ByteTrack; no hay
+                # descriptores de apariencia, matching adicional ni ReID.
+                track_id = int(raw_id_value)
+                info = {
+                    "bbox": bbox,
+                    "role": role,
+                    "class_name": class_name,
+                    "raw_track_id": track_id,
+                    "position": tuple(get_foot_position(bbox)),
+                }
+                tracks["players"][frame_num][track_id] = info
                 if role == "referee":
-                    tracks["referees"][frame_num][stable_id] = info.copy()
-
-                # Actualización temporal del descriptor para adaptarse a cambios
-                # moderados de luz sin sustituirlo bruscamente.
-                previous_hist = self._appearance.get(stable_id)
-                if descriptor is not None:
-                    if previous_hist is not None:
-                        descriptor = cv2.addWeighted(previous_hist.astype(np.float32), 0.65,
-                                                     descriptor.astype(np.float32), 0.35, 0)
-                        cv2.normalize(descriptor, descriptor, alpha=1.0, norm_type=cv2.NORM_L1)
-                    self._appearance[stable_id] = descriptor
-                current_center = np.asarray(get_center_of_bbox(bbox), dtype=float)
-                previous_center = self._last_center.get(stable_id)
-                previous_frame = self._last_seen.get(stable_id)
-                if previous_center is not None and previous_frame is not None:
-                    elapsed = max(1, frame_num - previous_frame)
-                    velocity = (current_center - np.asarray(previous_center, dtype=float)) / elapsed
-                    # Suavizar velocidad para que una detección ruidosa no
-                    # desvíe demasiado la predicción de reidentificación.
-                    old_velocity = np.asarray(self._last_velocity.get(stable_id, np.zeros(2)), dtype=float)
-                    self._last_velocity[stable_id] = 0.65 * old_velocity + 0.35 * velocity
-                else:
-                    self._last_velocity[stable_id] = np.zeros(2, dtype=float)
-                self._last_center[stable_id] = current_center
-                self._last_seen[stable_id] = frame_num
-                self._last_role[stable_id] = role
-                self._last_bbox[stable_id] = bbox
+                    tracks["referees"][frame_num][track_id] = info.copy()
 
             ball_candidates = []
             for item in dets:
@@ -515,7 +444,8 @@ class Tracker:
             if stub_dir:
                 os.makedirs(stub_dir, exist_ok=True)
             with open(stub_path, "wb") as file:
-                pickle.dump(tracks, file)
+                pickle.dump(tracks, file, protocol=pickle.HIGHEST_PROTOCOL)
+            _save_stub_metadata(stub_path, expected_meta)
         return tracks
 
     def add_position_to_tracks(self, tracks):
@@ -766,11 +696,13 @@ class CameraMovementEstimator:
         }
 
     def get_camera_movement(self, frames, read_from_stub=False, stub_path=None):
-        if read_from_stub and stub_path and os.path.exists(stub_path):
+        expected_meta = _stub_metadata(model_path=None, kind="camera")
+        if read_from_stub and stub_path and os.path.exists(stub_path) and _valid_stub_metadata(stub_path, expected_meta):
             try:
                 with open(stub_path, "rb") as file:
                     cached = pickle.load(file)
                 if len(cached) == len(frames):
+                    print("[Cámara] Caché válida: reutilizando movimiento estimado.")
                     return cached
             except Exception as exc:
                 print(f"[Cámara] No se pudo leer stub: {exc}")
@@ -799,7 +731,8 @@ class CameraMovementEstimator:
         if stub_path:
             os.makedirs(os.path.dirname(stub_path), exist_ok=True)
             with open(stub_path, "wb") as file:
-                pickle.dump(movements, file)
+                pickle.dump(movements, file, protocol=pickle.HIGHEST_PROTOCOL)
+            _save_stub_metadata(stub_path, expected_meta)
         return movements
 
     def add_adjust_positions_to_tracks(self, tracks, movements):
@@ -1274,8 +1207,9 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
 
     previous_positions = {}
     previous_ball_world = None
-    previous_ball_frame = None
+    previous_ball_world_frame = None
     previous_ball_px = None
+    previous_ball_px_frame = None
     distancias_recorridas = defaultdict(float)  # track_id -> metros acumulados
     max_speed_ms = 55.0
     max_gap_seconds = 0.25
@@ -1423,14 +1357,20 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
             if (view_transformer is not None and getattr(view_transformer, "enabled", False)):
                 ball_world = None
                 try:
-                    ball_world = view_transformer.transform_point(ball_pos)
+                    try:
+                        # AutoCalibrador necesita el frame actual: usar siempre
+                        # la homografía correspondiente al instante del balón.
+                        ball_world = view_transformer.transform_point(ball_pos, frame_num=frame_num)
+                    except TypeError:
+                        # Compatibilidad con ViewTransformer y calibradores antiguos.
+                        ball_world = view_transformer.transform_point(ball_pos)
                 except Exception:
-                    pass
+                    ball_world = None
                 if ball_world is not None:
                     ball_world = np.asarray(ball_world, dtype=float).reshape(-1)[:2]
                     if (ball_world.size == 2 and np.isfinite(ball_world).all()):
-                        if (previous_ball_world is not None and previous_ball_frame is not None):
-                            frames_elapsed = frame_num - previous_ball_frame
+                        if (previous_ball_world is not None and previous_ball_world_frame is not None):
+                            frames_elapsed = frame_num - previous_ball_world_frame
                             dt = frames_elapsed / fps
                             if frames_elapsed > 0 and 0 < dt <= max_gap_seconds:
                                 distance_m = float(np.linalg.norm(ball_world - previous_ball_world))
@@ -1441,16 +1381,16 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
                                     metodo_velocidad = "homografía"
                                 else:
                                     previous_ball_world = None
-                                    previous_ball_frame = None
+                                    previous_ball_world_frame = None
                         if ball_world is not None:
                             previous_ball_world = ball_world.copy()
-                            previous_ball_frame = frame_num
+                            previous_ball_world_frame = frame_num
 
             if speed_ms is None and ball_pos is not None:
                 escala_balon = estimar_escala_balon_por_jugador_cercano(players, ball_pos)
                 if escala_balon is not None:
-                    if previous_ball_px is not None and previous_ball_frame is not None:
-                        frames_elapsed = frame_num - previous_ball_frame
+                    if previous_ball_px is not None and previous_ball_px_frame is not None:
+                        frames_elapsed = frame_num - previous_ball_px_frame
                         dt = frames_elapsed / fps
                         if frames_elapsed > 0 and 0 < dt <= max_gap_seconds:
                             dist_px = float(np.linalg.norm(np.asarray(ball_pos) - np.asarray(previous_ball_px)))
@@ -1461,10 +1401,10 @@ def create_tactical_video(frames, tracks, team_ball_control, output_path, evento
                                 speed_kmh = candidate_speed * 3.6
                                 metodo_velocidad = "ref. jugador"
                     previous_ball_px = np.asarray(ball_pos, dtype=float).copy()
-                    previous_ball_frame = frame_num
+                    previous_ball_px_frame = frame_num
                 else:
                     previous_ball_px = None
-                    previous_ball_frame = None
+                    previous_ball_px_frame = None
 
             if speed_ms is not None:
                 speed_text = f"Velocidad balón ({metodo_velocidad}): {speed_ms:.1f} m/s ({speed_kmh:.1f} km/h)"
@@ -1668,7 +1608,7 @@ def main():
 
     print("\n2/6 - Detectando y siguiendo objetos...")
     tracker = Tracker(MODEL_PATH)
-    tracks = tracker.get_object_tracks(frames, read_from_stub=False, stub_path=str(TRACKS_STUB))
+    tracks = tracker.get_object_tracks(frames, read_from_stub=True, stub_path=str(TRACKS_STUB))
     if len(tracks["players"]) != len(frames):
         raise RuntimeError(f"La cantidad de fotogramas no coincide con el tracking: {len(frames)} vs {len(tracks['players'])}")
     tracker.add_position_to_tracks(tracks)
@@ -1693,7 +1633,7 @@ def main():
 
     print("\n4/6 - Estabilizando coordenadas y cargando calibración...")
     camera_estimator = CameraMovementEstimator(frames[0])
-    camera_movements = camera_estimator.get_camera_movement(frames, read_from_stub=False, stub_path=str(CAMERA_STUB))
+    camera_movements = camera_estimator.get_camera_movement(frames, read_from_stub=True, stub_path=str(CAMERA_STUB))
     print(f"Desplazamientos de cámara: {len(camera_movements)}")
     camera_estimator.add_adjust_positions_to_tracks(tracks, camera_movements)
 

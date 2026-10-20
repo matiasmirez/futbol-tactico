@@ -260,7 +260,8 @@ def detectar_alertas_defensivas(
                     carry_last_point, carry_last_frame = player_point.copy(), i
 
             # Candidato de remate: pelota muy rápida y poseedor cercano al balón.
-            if ball_speed_px_s is not None and ball_speed_px_s > 650 and owner is not None:
+            # Umbral subido de 650 a 800 px/s para evitar falsos positivos.
+            if ball_speed_px_s is not None and ball_speed_px_s > 800 and owner is not None:
                 if i - last_event_frame > int(0.8 * fps):
                     speed_kmh = None
                     if ball_distance_px is not None and last_ball_frame is not None and i > 0:
@@ -279,6 +280,7 @@ def detectar_alertas_defensivas(
         else:
             lost_frames += 1
             # Ball moving quickly while owner is unknown can be a shot, pass, clearance or occlusion.
+            # Umbral subido a 800 px/s.
             if ball_speed_px_s is not None and ball_speed_px_s > 800 and i - last_event_frame > int(0.8 * fps):
                 team_guess = last_team if last_team in (TEAM_ARGENTINA, TEAM_ENGLAND) else TEAM_NEUTRAL
                 speed_kmh = None
@@ -291,7 +293,8 @@ def detectar_alertas_defensivas(
                      velocidad_tiro_km_h=round(speed_kmh, 1) if speed_kmh is not None else None,
                      velocidad_tiro_metodo="calibración de cancha" if speed_kmh is not None else "no disponible sin calibración fiable")
                 last_event_frame = i
-            if carry_owner is not None and carry_distance > 0.5 and lost_frames >= max(2, int(0.3 * fps)):
+            # Umbral de pérdida aumentado de 0.3 a 0.5 segundos
+            if carry_owner is not None and carry_distance > 0.5 and lost_frames >= max(3, int(0.5 * fps)):
                 emit("conduccion", carry_start if carry_start is not None else i,
                      carry_last_frame if carry_last_frame is not None else i,
                      f"J{carry_owner} condujo antes de perderse el contacto con el balón.",

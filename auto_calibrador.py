@@ -33,7 +33,8 @@ FIELD_POINTS_M = np.array(
 )
 KEYPOINTS_AREAS = ((1, 2, 3, 4), (17, 18, 19, 20))
 VISIBILITY_MIN = 0.25
-REDETECT_EVERY = 12
+REDETECT_EVERY = 18
+MAX_ANCHOR_SAMPLES = 120
 MIN_POLYGON_AREA_PX = 1500.0
 ASPECT_MIN = 1.15
 ASPECT_MAX = 9.0
@@ -160,9 +161,17 @@ class AutoCalibrador:
         _, area_id, points = max(candidates, key=lambda x: x[0])
         return area_id, points
 
-    def _buscar_mejor_frame(self, frames, paso=3):
+    def _buscar_mejor_frame(self, frames, paso=None):
         best = None
-        for idx in range(0, len(frames), max(1, int(paso))):
+        # La búsqueda inicial es la parte más cara: limitar la inferencia YOLO
+        # a una muestra distribuida por todo el clip. El refinamiento temporal
+        # sigue ocurriendo durante la propagación y las redetecciones.
+        if paso is None:
+            paso = max(8, int(np.ceil(len(frames) / float(MAX_ANCHOR_SAMPLES))))
+        paso = max(1, int(paso))
+        print(f"[AutoCalibrador] Búsqueda inicial: 1 de cada {paso} frames "
+              f"(máximo aproximado {MAX_ANCHOR_SAMPLES} muestras).")
+        for idx in range(0, len(frames), paso):
             candidate = self._mejor_area(frames[idx])
             if candidate is None:
                 continue
@@ -301,7 +310,7 @@ class AutoCalibrador:
         self.pixel_vertices.clear()
         self.calibration_segment_by_frame.clear()
         self.area_id_by_frame.clear()
-        anchor_frame, area_id, points = self._buscar_mejor_frame(frames, paso=cada_n or 3)
+        anchor_frame, area_id, points = self._buscar_mejor_frame(frames, paso=cada_n)
         if anchor_frame is None:
             self.enabled = False
             return 0
